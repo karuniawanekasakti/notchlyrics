@@ -26,6 +26,8 @@ from tkinter import colorchooser, font as tkfont, ttk
 CONFIG = Path(__file__).with_name("config.json")
 MAGIC = "#010203"       # key colour Windows drops when -transparentcolor is on
 RETRY_S = 30            # re-ask lrclib after a failed fetch, don't cache the miss
+TAB = "tab: "           # Source value prefix for a single browser tab
+_TABS = (0.0, [])       # (monotonic stamp, tab list) cache for browser_tabs()
 
 
 def bootstrap():
@@ -173,6 +175,54 @@ def clean_name(s):
     return re.sub(r"\s+", " ", s).strip(" -–—")
 
 
+YT_NOISE = re.compile(
+    r"\s*\b(official|lyrics?|lyric\s+video|audio|video|music\s+video|mv|m/v|hd|hq|"
+    r"4k|8k|remaster(ed)?|visuali[sz]er|performance|live|explicit|clean|"
+    r"color\s+coded|sub(?:title[ds])?)\b[\s\-–—|]*$", re.I)
+
+
+def split_track(title, artist):
+    """Recover (title, artist) from a YouTube-style caption.
+
+    A browser tab publishes the VIDEO title as the track name, in whichever
+    order the uploader typed it: 'Sydney Rose - We Hug Now (Official Video)'
+    or 'We Hug Now – Sydney Rose'. lrclib searches on 'artist title', so feeding
+    it the caption unchanged matches nothing and the overlay falls back to
+    showing the caption as if it were a lyric line.
+
+    When the known artist sits on one side of the separator, the other side is
+    the title. When there is no artist to compare against, assume the YouTube
+    convention 'Artist - Title'.
+
+    Noise words are only stripped from the END of the string: 'Live Forever' is
+    a real song, so a bare 'live' anywhere else must survive.
+    """
+    t = re.sub(r"[\(\[\{].*?[\)\]\}]", " ", title or "")   # (Official Video)
+    while True:                                           # '... Official Video'
+        trimmed = YT_NOISE.sub("", t)
+        if trimmed == t:
+            break
+        t = trimmed
+    t = re.sub(r"\s+", " ", t).strip(" -–—|")
+    a = (artist or "").strip()
+    parts = re.split(r"\s+([-–—•|])\s+", t, maxsplit=1)
+    if len(parts) == 3:
+        left, sep, right = parts[0].strip(), parts[1], parts[2].strip()
+        if a:
+            al = a.lower()
+            if right.lower() == al or al in right.lower():
+                return left, a            # 'Title – Artist'
+            if left.lower() == al or al in left.lower():
+                return right, a           # 'Artist - Title'
+        # No artist to compare against, so the separator decides the order:
+        # a bullet or an en/em dash is a "title – artist" label (YouTube Music
+        # and Brave tabs use it); a plain hyphen is YouTube's "artist - title".
+        # ponytail: a guess, and a harmless one — lrclib ignores word order
+        # (measured: both orders return the same hit), so only the SPLIT matters.
+        return (left, right) if sep in "•|–—" else (right, left)
+    return t, a
+
+
 def fetch_lyrics(title, artist, track_len=None):
     """Best synced lyrics for this track, picked by DURATION.
 
@@ -180,6 +230,7 @@ def fetch_lyrics(title, artist, track_len=None):
     209s ...). Taking the first hit with syncedLyrics is how lyrics end up 30s
     off. Duration is the only reliable discriminator, so ask for it.
     """
+    title, artist = split_track(title, artist)
     title, artist = clean_name(title), clean_name(artist)
     q = urllib.parse.urlencode({"q": f"{artist} {title}".strip()})
     req = urllib.request.Request(
@@ -250,6 +301,8 @@ def pick_session(items, source="Auto"):
     the tab strip could win over the song actually playing.
     """
     want = "" if (source or "").strip().lower() in ("", "auto") else source.strip().lower()
+    if want.startswith(TAB):
+        return None          # tab sources are resolved by _probe, not by app id
     if want:
         items = [i for i in items if want in i["app"].lower()]
     if not items:
@@ -314,6 +367,69 @@ def art_png(ref):
         return b""
 
 
+def browser_tabs(max_age=0.0):
+    """Every tab in every open Chromium-family window: [(browser, title)].
+
+    SMTC publishes ONE session per browser, so a Brave window playing music and
+    a Brave window showing YouTube look identical to it — there is no per-tab
+    identity in the media-session API at all. The tab strip is the only place
+    that information exists, so read it through UI Automation.
+
+    Costs ~0.5s for a dozen tabs. The poll loop runs every 0.3s, so it asks for
+    a cached answer (max_age>0) and only the launcher dropdown pays full price.
+    """
+    global _TABS
+    now = time.monotonic()
+    if max_age and _TABS[1] and now - _TABS[0] < max_age:
+        return _TABS[1]
+    try:
+        import uiautomation as auto
+    except ImportError:
+        return []                    # optional dependency; dropdown still works
+    out = []
+    try:
+        for w in auto.GetRootControl().GetChildren():
+            try:
+                if w.ClassName != "Chrome_WidgetWin_1":
+                    continue
+                name = w.Name or ""
+                browser = next((b for b in ("Brave", "Google Chrome", "Chromium",
+                                            "Microsoft Edge", "Vivaldi")
+                                if name.endswith("- " + b)), "")
+                if not browser:
+                    continue
+                first = w.TabItemControl(searchDepth=8)
+                if not first.Exists(0.3):
+                    continue
+                for c in first.GetParentControl().GetChildren():
+                    if c.ControlTypeName == "TabItemControl" and c.Name:
+                        out.append((browser, c.Name))
+            except Exception:
+                continue                 # one dead window must not kill the list
+    except Exception:
+        return []
+    _TABS = (now, out)
+    return out
+
+
+def tab_label(title):
+    """Trim Brave's tab-decoration tail: '... - Audio playing - Memory usage - 336 MB'."""
+    t = re.sub(r"\s+-\s+(?:Audio playing|Memory usage|Muted).*$", "", title or "")
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def tab_song(tab_title):
+    """(title, artist) for the song a tab is playing, or ('', '') if none.
+
+    Brave marks a tab that is making sound with ' - Audio playing' in its
+    accessible name, so that suffix is the per-tab equivalent of SMTC's
+    playback status. Only those tabs can be a lyric source.
+    """
+    if "Audio playing" not in (tab_title or ""):
+        return "", ""
+    return split_track(tab_label(tab_title), "")
+
+
 def app_label(app):
     """'Spotify.exe' -> 'Spotify'. The label is a substring of the session's
     app id, so pick_session's filter matches what the dropdown shows."""
@@ -324,15 +440,43 @@ def app_label(app):
 
 
 def app_names():
-    """Dropdown values: Auto plus every player SMTC currently knows about."""
+    """Dropdown values: Auto, then tabs that are making sound, then players."""
     try:
         apps = {app_label(i["app"]) for i in sessions() if i["app"]}
     except Exception:
         apps = set()          # SMTC unavailable -> dropdown still offers Auto
-    return ["Auto"] + sorted(apps, key=str.lower)
+    tabs = [TAB + "%s :: %s" % (b, tab_label(t))
+            for b, t in browser_tabs() if "Audio playing" in (t or "")]
+    return ["Auto"] + tabs + sorted(apps, key=str.lower)
 
 
 def _probe(source="Auto"):
+    """Pick the session to follow. Returns a session dict or None.
+
+    A `tab:` source is not an SMTC session — it is one tab inside a browser
+    that has exactly one. The browser's session still carries the right
+    position, length, cover and title for whichever tab is making sound, so the
+    tab's own label is only needed to identify it; the parsed title is a
+    fallback for when SMTC reports none.
+
+    ponytail: assumes one playing tab per browser, which is what SMTC models.
+    Two Brave windows both playing would still collapse into one session.
+    """
+    if (source or "").startswith(TAB):
+        browser, _, wanted = source[len(TAB):].partition(" :: ")
+        items = [i for i in sessions() if app_label(i["app"]) == browser]
+        if not items:
+            return None
+        base = dict(pick_session(items))
+        for b, t in browser_tabs(max_age=1.5):
+            if b == browser and tab_label(t) == wanted:
+                title, artist = tab_song(t)
+                if not title:
+                    return None      # tab stopped playing since the dropdown opened
+                base["title"] = base["title"] or title
+                base["artist"] = base["artist"] or artist
+                return base
+        return None                  # tab closed / renamed
     items = [i for i in sessions()
              if is_song(i["title"], i["artist"], i["len"])]  # a video's caption is not a song
     return pick_session(items, source)
@@ -505,7 +649,7 @@ class Overlay:
         self._from = self._to = 0.0
         self._t0 = 0.0
         self._art_png = b""
-        self._art_size = 0
+        self._art_size = None    # cache key: everything the art label is built from
         self._x0, self._w = 0, cfg["width"]
         self.win = tk.Toplevel(root)
         self.win.overrideredirect(True)
@@ -517,7 +661,8 @@ class Overlay:
         self.box.place(x=0, y=0, relwidth=1, relheight=1)
         self.art = None          # album-art label, only when art is enabled
         self.viz = None          # waveform canvas, only when viz is enabled
-        self._art_key = None     # which track the current image belongs to
+        self._art_key = b""      # the cover bytes the current image was made from
+        self._art_shown = False  # is self.art placed on screen right now?
         self.win.bind("<Map>", lambda e: self._clickthrough())
         self.apply(cfg)
 
@@ -577,8 +722,24 @@ class Overlay:
         pad_x = cfg["radius"] if cfg["card"] else 0
         self.box.configure(bg=bg)
 
+        # Lyric rows: geometry is computed once here and only re-used by
+        # render(), so the row rect (and its radius inset) can never be
+        # overridden by the animation frame.
+        self._x0 = pad_x
+        self._w = max(20, w - 2 * pad_x)
+
         # --- album art -----------------------------------------------------
         self._render_art(cfg)
+        # The cover's geometry is set here, after _render_art and before the
+        # lyric rows, never inside _render_art: see the note at the label.
+        # The image's own width/height are authoritative even before Tk has laid
+        # the new label out (its winfo_width() is still 1 at this point).
+        self._art_shown = False
+        if cfg["art"] and self.art is not None:
+            aw, ah = self._art_img.width(), self._art_img.height()
+            self.art.place(x=10, y=(h - ah) // 2, width=aw, height=ah)
+            self._art_shown = True
+            self._x0 = 10 + aw + 12
 
         # --- waveform bars at the right edge --------------------------------
         # Own canvas, child of the text frame: the big canvas sits *behind* the
@@ -589,11 +750,12 @@ class Overlay:
             self.viz.destroy()
             self.viz = None
         self._viz_ids = []
-        self._viz_n = max(1, cfg["viz_bars"])
-        bw, gap = 3, 4
-        self._viz_gutter = (bw + gap) * self._viz_n + 10 if cfg["viz"] else 0
+        self._viz_gutter = 0             # px of the row the bars reserve
         if cfg["viz"]:
-            gw = self._viz_gutter
+            bw, gap, pad = 4, 4, 12
+            gw = pad * 2 + cfg["viz_bars"] * bw + (cfg["viz_bars"] - 1) * gap
+            gw = min(gw, max(20, w // 3))
+            self._viz_n = max(1, (gw - pad * 2 + gap) // (bw + gap))
             self.viz = tk.Canvas(self.box, width=gw, height=h, bd=0,
                                  highlightthickness=0, bg=lbl_bg)
             self.viz.place(x=w - gw - max(0, pad_x - 6), y=0, width=gw, height=h)
@@ -603,16 +765,11 @@ class Overlay:
                     x, h // 2, x, h // 2, width=bw, capstyle="round",
                     fill=cfg["viz_color"]))
                 x -= bw + gap
+            self._viz_gutter = gw - max(0, pad_x - 6) + 6
 
         # Lyric rows: geometry is computed once here and only re-used by
         # render(), so the row rect (and its radius inset) can never be
         # overridden by the animation frame.
-        self._x0 = pad_x
-        self._w = max(20, w - 2 * pad_x)
-        if cfg["art"] and self.art is not None:
-            aw = self.art.winfo_width() or 0
-            if aw:
-                self._x0 = aw + 22
         self._w = max(20, w - self._x0 - pad_x - self._viz_gutter)
 
         for lbl in self.lines:
@@ -631,48 +788,93 @@ class Overlay:
         self._viz_tick()
 
     def _render_art(self, cfg):
-        """Album art as a Tk image. PhotoImage only scales by integer factors, so
-        the source is halved repeatedly until it is close to art_size."""
-        if not cfg["art"]:
-            if self.art is not None:
-                self.art.destroy()
-                self.art = None
-            return
-        key = self._art_key
-        want = cfg["art_size"]
-        if self.art is not None and getattr(self, "_art_size", None) == want:
-            return
-        if self.art is not None:
+        """Album art as a Tk image, sized to what the card can actually hold.
+
+        Two separate bugs lived here. (1) The size cache was keyed on art_size
+        alone, so a new track's cover was never decoded: the next track showed
+        the previous cover, or nothing when the previous decode had failed (as
+        it does for webp). (2) PhotoImage only scales by integer factors, so
+        halving stopped at the first size <= 2*art_size -- up to 2x too big.
+        On the notch (34px cover, 52px card) the label then swallowed the
+        whole card and the cover was drawn clipped in half.
+
+        The result is the size closest to, but never larger than, the box, so
+        the cover never fills or overflows the card. art_size is the ceiling;
+        the card's height is the hard limit.
+        """
+        # The key must include everything the label is built from: the cover
+        # bytes, the box the image is fitted into, and the label's background.
+        # Leaving `art` out meant switching art OFF kept the old cover on
+        # screen, because the cached key still matched.
+        key = (self._art_png, cfg["art_size"], self.row_h(), cfg["lines"],
+               cfg["art"], cfg["bg"] if cfg["card"] else self.box.cget("bg"))
+        if self._art_shown and self._art_alive() and self._art_size == key:
+            return                       # same cover, same box: nothing to redraw
+        if self.art is not None and self._art_alive():
             self.art.destroy()
-            self.art = None
-        if not self._art_png:
+        self.art = None
+        self._art_key = self._art_png
+        self._art_size = key
+        if not cfg["art"] or not self._art_png:
             return
+        slot_h = self.row_h() * max(1, cfg["lines"])
+        box = max(1, min(cfg["art_size"], slot_h - 2))
         try:
             img = tk.PhotoImage(data=base64.b64encode(self._art_png).decode())
         except tk.TclError:
             return                       # not a format Tk can read (webp, etc.)
-        while img.width() > want * 2:
-            img = img.subsample(2, 2)
+        # Tk's b"..." data reader keeps the source size, so subsample()/zoom()
+        # from the master hit the file's real resolution each time.
+        # subsample(k) then zoom(z) gives source*z/k. k in [k0, k0+4] with
+        # k0 = ceil(w/box) pairs a coarse downsample with 1x/2x/4x/8x, so a
+        # cover can also be scaled UP into the box (a small source used to stay
+        # tiny). Candidates over the box are skipped, so the cover always fits.
+        src = img
+        k0 = max(1, -(-src.width() // box))
+        best = None                      # (width, k, z), widest that still fits
+        for k in range(k0, k0 + 5):
+            s = src if k == 1 else src.subsample(k, k)
+            for z in (1, 2, 4, 8):
+                w = s.width() * z
+                if w <= box and (best is None or w > best[0]):
+                    best = (w, k, z)
+        if best is None:
+            return
+        _, k, z = best
+        s = img if k == 1 else img.subsample(k, k)
+        img = s.zoom(z, z) if z > 1 else s
         self._art_img = img              # keep a reference or Tk collects it
         # On a card the label must be card-coloured: a MAGIC background would
         # punch a transparent rectangle around the cover, straight through the
         # card, because the colour key applies to the composited window.
         lbg = cfg["bg"] if cfg["card"] else self.box.cget("bg")
         self.art = tk.Label(self.box, image=img, bg=lbg, bd=0)
-        h = self.row_h() * max(1, cfg["lines"])
-        self.art.place(x=10, y=(h - img.height()) // 2, width=img.width(),
-                       height=img.height())
-        self._art_size = want
+        # Only created here. Where it sits is apply()'s call (see below): place()
+        # re-enters the geometry manager, which runs the label's own callback
+        # on the *current* box size, and that callback quits with return
+        # "break" -- aborting the rest of apply() and leaving self.art pointing
+        # at a widget that is already gone. The next apply() then found that
+        # dead handle ("is not None") and took the "cover already drawn"
+        # early return, so the art vanished for every later track until some
+        # other change re-rendered it. Hence no place() here, and
+        # _art_shown remembers whether the cover is really on screen.
+        self._art_shown = False
+
+    def _art_alive(self):
+        """True when self.art is a widget that still exists."""
+        if self.art is None:
+            return False
+        try:
+            return bool(self.art.winfo_exists())
+        except tk.TclError:
+            return False
 
     def set_art(self, png):
         """New track: swap the cover if it actually changed."""
         if png == self._art_png:
             return
         self._art_png = png
-        if self.art is not None:
-            self.art.destroy()
-            self.art = None
-        self._art_size = 0
+        self._art_size = None
         self.apply(self.cfg)
 
     def render(self, pos=None):
@@ -1106,7 +1308,9 @@ if __name__ == "__main__":
         assert app_label("Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic") == \
             "Microsoft.ZuneMusic"
         real = sessions
+        real_tabs = browser_tabs
         try:
+            globals()["browser_tabs"] = lambda *a, **k: []
             globals()["sessions"] = lambda: [
                 {"app": "Spotify.exe"}, {"app": "Brave"}, {"app": "Brave"}, {"app": ""}]
             assert app_names() == ["Auto", "Brave", "Spotify"], app_names()
@@ -1114,6 +1318,45 @@ if __name__ == "__main__":
             assert app_names() == ["Auto"]   # SMTC dead -> launcher still usable
         finally:
             globals()["sessions"] = real
+            globals()["browser_tabs"] = real_tabs
+
+        # a YouTube caption is 'Artist - Title (Official Video)'; searching
+        # lrclib with it verbatim matches nothing and the overlay shows the
+        # caption as if it were a lyric line
+        assert split_track("Sydney Rose - We Hug Now (Official Video)",
+                           "Sydney Rose") == ("We Hug Now", "Sydney Rose")
+        assert split_track("Sydney Rose - We Hug Now (Official Video)",
+                           "") == ("We Hug Now", "Sydney Rose")
+        assert split_track("Taylor Swift - Guilty as Sin? (Official Lyric Video)",
+                           "Taylor Swift") == ("Guilty as Sin?", "Taylor Swift")
+        # title-first order (a Brave tab uses 'Title • Artist')
+        assert split_track("What if I miss you for the rest of my life? \u2022 "
+                           "Janine Berdin", "") == (
+            "What if I miss you for the rest of my life?", "Janine Berdin")
+        assert split_track("We Hug Now", "Sydney Rose") == ("We Hug Now", "Sydney Rose")
+        # a song whose name contains a noise word must keep it
+        assert split_track("Live Forever (Official Video)", "Oasis") == (
+            "Live Forever", "Oasis")
+        assert split_track("", "") == ("", "")
+
+        # a tab label carries Brave's decorations; only a playing tab is a source
+        playing = "We Hug Now \u2013 Sydney Rose - Audio playing - Memory usage - 336 MB"
+        assert tab_label(playing) == "We Hug Now \u2013 Sydney Rose", tab_label(playing)
+        assert tab_label("Discord - Memory usage - 246 MB") == "Discord"
+        assert tab_song("Discord - Memory usage - 246 MB") == ("", "")
+        assert tab_song(playing) == ("We Hug Now", "Sydney Rose")
+        # tab: sources must never be mistaken for an app id
+        assert pick_session([a, b], TAB + "Brave :: We Hug Now") is None
+        # an unknown/closed tab resolves to nothing instead of a wrong song
+        try:
+            globals()["sessions"] = lambda: [dict(b, artist="Sydney Rose", len=248.9)]
+            globals()["browser_tabs"] = lambda *x, **k: [("Brave", playing)]
+            assert _probe(TAB + "Brave :: Gone") is None
+            got = _probe(TAB + "Brave :: We Hug Now \u2013 Sydney Rose")
+            assert got and got["title"] == "B", got
+        finally:
+            globals()["sessions"] = real
+            globals()["browser_tabs"] = real_tabs
 
         assert sanitize({"source": "  "})["source"] == "Auto"
         assert sanitize({"source": None})["source"] == "Auto"

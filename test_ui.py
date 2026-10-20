@@ -5,7 +5,9 @@ animates, and that a config written by the UI is read back.
     .venv\\Scripts\\python.exe test_ui.py
 """
 import base64
+import importlib.machinery
 import importlib.util
+import sys
 import tempfile
 import threading
 import time
@@ -15,7 +17,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 
-spec = importlib.util.spec_from_file_location("nl", HERE / "NotchLyrics.pyw")
+# spec_from_file_location() returns None for a .pyw on POSIX, so name the loader
+spec = importlib.util.spec_from_loader(
+    "nl", importlib.machinery.SourceFileLoader("nl", str(HERE / "NotchLyrics.pyw")))
 nl = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(nl)
 
@@ -28,7 +32,10 @@ tk.Toplevel.mainloop = lambda self, n=0: None
 
 # kill the real poll thread: it hits SMTC + lrclib and would race our fake state
 real_poll = nl.poll
-nl.poll = lambda state, stop: None
+nl.poll = lambda state, stop, cfg=None: None
+if sys.platform != "win32":
+    nl.sessions = lambda: []         # no SMTC: the Source dropdown just offers Auto
+    nl.Overlay._clickthrough = lambda self: None    # ctypes.windll only exists on Windows
 
 app = nl.App()
 root = app.root
@@ -408,8 +415,10 @@ settle()
 x_positions = {lbl.winfo_x() for lbl in ov.lines if lbl.winfo_ismapped()}
 assert x_positions and min(x_positions) >= 14, x_positions
 
-# a real image: 1x1 GIF, the smallest thing Tk is guaranteed to decode
-tiny = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
+# a real image: 1x1 GIF (GIF87a with the full 11-byte raster block; Tk rejects
+# the short "1x1 hack" variant with "image format error"), the smallest thing
+# Tk is guaranteed to decode
+tiny = base64.b64decode("R0lGODdhAQABAIEAAP///wAAAAAAAAAAACwAAAAAAQABAAAIBAABBAQAOw==")
 ov.set_art(tiny)
 root.update()
 assert ov.art is not None, "art was not drawn"
@@ -420,6 +429,49 @@ assert ov._art_png == tiny
 ov.set_art(b"not a png")
 root.update()
 assert ov.art is None
+
+
+# a new track's cover must be re-fitted to the card on EVERY change. The size
+# cache used to be keyed on art_size alone, so after one set_art() the next
+# track reused the old decode; when that decode had failed the cover vanished,
+# and when it had not the cover kept an old (too big) size -> drawn clipped.
+def fakepng(w, h, rgb):
+    import struct
+    import zlib
+    raw = b"".join(b"\x00" + bytes(rgb) * w for _ in range(h))
+
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + \
+            struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    return b"\x89PNG\r\n\x1a\n" + \
+        chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + \
+        chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+
+
+
+app.preset(nl.PRESET_CARD)                  # the notch: 34px art in a 52px card
+app.state["art"] = b""
+app.tick_once()                             # nothing showing yet
+root.update()
+card = ov.row_h() * ov.cfg["lines"]
+for n, px in enumerate((600, 640, 1000, 300, 600)):
+    app.state["art"] = fakepng(px, px, (40 * n, 90, 160))
+    app.state["lines"], app.state["idx"] = [f"track{n} a", f"track{n} b"], 0
+    app.tick_once()
+    root.update()
+    assert ov.art is not None, f"track {n}: cover not drawn"
+    assert ov._art_img.width() <= ov.cfg["art_size"], (px, ov._art_img.width())
+    assert ov.art.winfo_height() <= card - 2, (px, ov.art.winfo_height(), card)
+    assert ov.art.winfo_y() >= 0 and ov.art.winfo_y() + ov.art.winfo_height() <= card
+    assert ov._x0 > 10 + ov._art_img.width(), (ov._x0, ov._art_img.width())  # lyrics clear the cover
+app.state["art"] = b""
+app.tick_once()
+root.update()
+assert ov.art is None, "cover stayed after the track lost its art"
+app.state["art"] = fakepng(600, 600, (1, 2, 3))
+app.tick_once()
+root.update()
+assert ov.art is not None, "cover did not come back after being empty"
 
 # turning art off removes it and gives the text the full width back
 app.art_var.set(False)

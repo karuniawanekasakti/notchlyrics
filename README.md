@@ -33,7 +33,7 @@ Everything is in the launcher window, and changes apply live:
 | Control | Effect |
 |---|---|
 | **Preset: Spotify / Pill / Card** | one click sets every field below to that style |
-| Source | which player to follow. The list is built from the SMTC sessions Windows is publishing right now, so every open player appears (`Brave`, `Spotify`, `msedge`, …) and idle ones are listed too. `Auto` follows whichever session is actually playing. The field is editable, so a player that is not running yet can still be typed in |
+| Source | which player to follow. The list is built from the SMTC sessions Windows is publishing right now, so every open player appears (`Brave`, `Spotify`, `msedge`, …) and idle ones are listed too. A `tab: ` entry pins the overlay to one browser tab that is making sound, which is the only way to tell two tabs of the same browser apart (see below). `Auto` follows whichever session is actually playing. The field is editable, so a player that is not running yet can still be typed in |
 | Visible lines | 1 gives a single-line pill, 5 gives the Spotify panel |
 | Row height | pitch between rows; total height is row height × visible lines. If it is shorter than the font's ink box it is raised automatically so descenders (`g y p j`) are never clipped |
 | Width (px) | width of the block |
@@ -80,9 +80,11 @@ Verify the live SMTC session and real lyrics (a track must be playing):
 | Component | Responsibility |
 |---|---|
 | `sessions()` | every SMTC session on the machine, songs and non-songs alike — feeds both the overlay and the Source dropdown |
-| `app_names()` | `Auto` + one label per live session (`Spotify.exe` → `Spotify`, `PackageFamily!AppId` → `AppId`); returns just `Auto` if SMTC is unavailable |
-| `pick_session()` | playing wins over paused, then an optional case-insensitive app-id filter from the Source setting |
-| `_probe()` | `sessions()` filtered by `is_song()` and handed to `pick_session()` |
+| `app_names()` | `Auto`, then one `tab: ` entry per browser tab that is making sound, then one label per live session (`Spotify.exe` → `Spotify`, `PackageFamily!AppId` → `AppId`); returns just `Auto` if SMTC is unavailable |
+| `browser_tabs()` | the tab strip of every Chromium-family window via UI Automation (`uiautomation`). SMTC publishes one session per browser, so this is the only source of per-tab identity. Cached for the poll loop, full price (~0.5 s) for the dropdown |
+| `split_track()` | `Sydney Rose - We Hug Now (Official Video)` → `("We Hug Now", "Sydney Rose")`. A browser publishes the video title as the track name, and lrclib matches nothing on it, which is why YouTube used to show its own title as a lyric line |
+| `pick_session()` | playing wins over paused, then an optional case-insensitive app-id filter from the Source setting; a `tab: ` source is resolved by `_probe()` instead |
+| `_probe()` | `sessions()` filtered by `is_song()` and handed to `pick_session()`; for a `tab: ` source it keeps the browser's session (position, length, cover) and uses the tab label to confirm the tab is still playing |
 | `fetch_lyrics()` | `lrclib.net/api/search` → `syncedLyrics` (free, no API key); picks the version whose duration matches the playing track |
 | `parse_lrc()` | `[mm:ss.xx]text` → `[(seconds, text)]` |
 | `poll()` | background thread: track + position → `state["lines"]` and `state["idx"]` |
@@ -123,8 +125,15 @@ lacks `winsdk` (3.14, for instance): it relaunches itself with
   frozen timeline (`position` stays at 0.01 s, `last_updated_time` at the moment
   it lost focus). Position is extrapolated from that anchor, so lyrics keep
   tracking normally; only a pause or seek performed while minimized can leave
-  the anchor stale until playback controls next update the session. Tab focus is
-  irrelevant — SMTC is per application, not per tab.
+  the anchor stale until playback controls next update the session.
+- SMTC is per application, not per tab: a browser publishes exactly one session
+  however many tabs are open. `tab: ` entries exist because the tab strip is
+  read separately through UI Automation, which needs the optional
+  `uiautomation` package. Without it the dropdown falls back to one entry per
+  player and `Auto` follows whichever tab is making sound — correct for one
+  playing tab, ambiguous when two are.
+- A tab only appears in the Source list while it is making sound; Brave marks
+  that with ` - Audio playing` in the tab's accessible name.
 - If the player drops the session entirely (Brave closed, playback stopped),
   lyrics disappear until a new session appears.
 - Tracks with no synced lyrics on lrclib fall back to `♪ title — artist`.
