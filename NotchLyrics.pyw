@@ -29,6 +29,12 @@ RETRY_S = 30            # re-ask lrclib after a failed fetch, don't cache the mi
 TAB = "tab: "           # Source value prefix for a single browser tab
 _TABS = (0.0, [])       # (monotonic stamp, tab list) cache for browser_tabs()
 
+# Where the bar sits on screen: the two centre edges and the four corners.
+# A side that touches a screen edge stays square so the bar reads as a notch
+# cut into that edge, not a card floating next to it.
+ANCHORS = ("top-center", "bottom-center",
+           "top-left", "top-right", "bottom-left", "bottom-right")
+
 
 def bootstrap():
     """Double-clicking the .pyw picks whatever python owns the extension, which
@@ -71,6 +77,7 @@ DEFAULTS = {
     "art": False,
     "art_size": 56,
     "align": "center",     # where the playhead sits: center or bottom
+    "anchor": "top-center",  # where the whole bar sits on screen
     "notch": True,         # flush with the top edge: only bottom corners round
     "viz": False,          # waveform bars at the right edge
     "viz_color": "#0095f5",
@@ -562,6 +569,8 @@ def sanitize(raw):
     d["viz"] = bool(d["viz"])
     d["notch"] = bool(d["notch"])
     d["align"] = d["align"] if d["align"] in ("center", "bottom") else DEFAULTS["align"]
+    d["anchor"] = (d["anchor"] if d["anchor"] in ANCHORS
+                   else DEFAULTS["anchor"])
     num("radius", 0, 200)
     num("art_size", 16, 300)
     num("viz_bars", 1, 12)
@@ -600,23 +609,51 @@ def lerp_color(c1, c2, t):
     return "#%02x%02x%02x" % tuple(round(x + (y - x) * t) for x, y in zip(a, b))
 
 
-def notch_shape(cv, x1, y1, x2, y2, r, **kw):
-    """Notch: flat top flush with the screen edge, rounded bottom corners only.
+def notch_corners(anchor):
+    """Which corners stay rounded for a bar pinned to `anchor`.
+
+    A side that touches a screen edge must be square, or the bar stops looking
+    attached to it. So the rounded set is every corner NOT on a flush edge:
+    top-center keeps br+bl, top-left keeps only br.
+    """
+    v, _, h = (anchor or "top-center").partition("-")   # 'top-center' -> top, center
+    out = ""
+    for corner, ch, cv in (("tl", "left", "top"), ("tr", "right", "top"),
+                           ("br", "right", "bottom"), ("bl", "left", "bottom")):
+        if h != ch and v != cv:
+            out += corner
+    return out or "brbl"
+
+
+def notch_shape(cv, x1, y1, x2, y2, r, rounded="brbl", **kw):
+    """Screen-edge shape: square on the sides that touch an edge, round elsewhere.
+
+    `rounded` lists the corners that keep the radius, as a string of
+    tl/tr/br/bl. A notch glued to the top edge rounds only br and bl; a card
+    floating in the middle rounds all four.
 
     The outline is computed here rather than with create_arc, because Tk's arc
     angles are easy to get a quadrant wrong on, and a smooth=True polygon bows
     the top edge (which makes it stop looking attached to the screen edge).
     """
     r = max(0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
-    pts = [(x1, y1), (x2, y1), (x2, y2 - r)]
+    # (name, arc centre, start degrees, the actual corner when not rounded).
+    # Walked clockwise; y grows downward, so 0deg is 3 o'clock, 90deg is 6.
+    quads = (
+        ("tl", x1 + r, y1 + r, 180, (x1, y1)),
+        ("tr", x2 - r, y1 + r, 270, (x2, y1)),
+        ("br", x2 - r, y2 - r, 0, (x2, y2)),
+        ("bl", x1 + r, y2 - r, 90, (x1, y2)),
+    )
+    pts = []
     steps = 8
-    for i in range(1, steps + 1):                 # bottom-right quarter
-        a = (math.pi / 2) * i / steps
-        pts.append((x2 - r + r * math.cos(a), y2 - r + r * math.sin(a)))
-    for i in range(1, steps + 1):                 # bottom-left quarter
-        a = (math.pi / 2) * (1 - i / steps)
-        pts.append((x1 + r - r * math.cos(a), y2 - r + r * math.sin(a)))
-    pts.append((x1, y2 - r))
+    for name, cx, cy, start, corner in quads:
+        if name in rounded and r:
+            for i in range(steps + 1):
+                a = math.radians(start + 90 * i / steps)
+                pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+        else:
+            pts.append(corner)
     flat = [c for p in pts for c in p]
     return cv.create_polygon(flat, fill=kw.get("fill"),
                              outline=kw.get("outline", ""),
@@ -679,8 +716,13 @@ class Overlay:
                         weight="bold" if cfg["bold"] else "normal")
         self._row = max(cfg["height"], f.metrics("linespace") + 2)
         h = self._row * max(1, cfg["lines"])
-        x = (self.win.winfo_screenwidth() - w) // 2 + cfg["x_off"]
-        self.win.geometry(f"{w}x{h}+{x}+{cfg['top']}")
+        # anchor picks the corner/edge the bar is pinned to; top/x_off stay as
+        # fine offsets on top of it, so an existing config keeps working.
+        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        ay, _, ax = cfg["anchor"].partition("-")   # 'top-center' -> top, center
+        x = {"left": 0, "center": (sw - w) // 2, "right": sw - w}[ax] + cfg["x_off"]
+        y = {"top": 0, "bottom": sh - h}[ay] + cfg["top"]
+        self.win.geometry(f"{w}x{h}+{x}+{y}")
         self.win.attributes("-alpha", cfg["alpha"])
         self.win.configure(bg=cfg["bg"])
         self.box.configure(bg=cfg["bg"])
@@ -702,11 +744,12 @@ class Overlay:
             # The card must fill the window edge to edge. With any inset the
             # label rects (which start at y=0) stick out past the polygon's top
             # and bottom edge and paint a square strip over the rounded shape.
-            # notch = flush with the top screen edge, so only the bottom corners
-            # are rounded; that is what makes it read as a notch and not a
-            # floating card.
+            # notch = flush with the screen edge on that side, so only the
+            # corners away from it are rounded; that is what makes it read as a
+            # notch and not a floating card.
             if cfg.get("notch", True):
                 notch_shape(self.canvas, 0, 0, w, h, cfg["radius"],
+                            rounded=notch_corners(cfg["anchor"]),
                             fill=cfg["bg"], outline=cfg["card_edge"], width=1)
             else:
                 round_rect(self.canvas, 0, 0, w, h, cfg["radius"],
@@ -1142,6 +1185,14 @@ class App:
         entry("Waveform bars", "viz_bars")
         color("Waveform colour", "viz_color")
 
+        ttk.Label(f, text="Position").grid(row=r, column=0, sticky="w", pady=3)
+        self.vars["anchor"] = tk.StringVar(value=c["anchor"])
+        ttk.Combobox(f, textvariable=self.vars["anchor"], values=ANCHORS,
+                     state="readonly", width=14).grid(row=r, column=1,
+                                                      sticky="w", padx=(10, 0))
+        self.vars["anchor"].trace_add("write", lambda *_: self.apply())
+        r += 1
+
         ttk.Label(f, text="Active line position").grid(row=r, column=0, sticky="w", pady=3)
         self.vars["align"] = tk.StringVar(value=c["align"])
         ttk.Combobox(f, textvariable=self.vars["align"], values=("center", "bottom"),
@@ -1191,6 +1242,7 @@ class App:
         c["card"] = self.card_var.get()
         c["viz"] = self.viz_var.get()
         c["align"] = self.vars["align"].get()
+        c["anchor"] = self.vars["anchor"].get()
         try:
             c["viz_bars"] = int(float(self.vars["viz_bars"].get()))
         except (ValueError, tk.TclError):

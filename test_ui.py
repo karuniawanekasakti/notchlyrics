@@ -497,18 +497,24 @@ assert back["card"] is True and back["art"] is True and back["radius"] == 14, ba
 assert back["viz"] is True and back["viz_bars"] == 4 and back["align"] == "bottom", back
 assert back["notch"] is True, back
 
-# the notch shape: flat top edge, rounded bottom corners only. A smooth polygon
-# would bow the top too, so the first two vertices must both sit at y=0.
+# the notch shape: the top edge is flush with the screen, so it must be dead
+# straight and the bottom corners rounded. A smooth polygon would bow the top,
+# so the polygon must be built from explicit points.
 polys = [i for i in ov.canvas.find_all() if ov.canvas.type(i) == "polygon"]
 assert len(polys) == 1, polys
 c = ov.canvas.coords(polys[0])
-assert c[0] == 0 and c[1] == 0, c[:2]                  # top-left at the corner
-assert c[2] == 380 and c[3] == 0, c[2:4]               # flat top, full width
 assert ov.canvas.itemcget(polys[0], "smooth") in ("0", "false", ""), \
     ov.canvas.itemcget(polys[0], "smooth")             # no spline bow
-# bottom vertices must be pulled in by the radius, i.e. actually rounded
+# top-center anchor: both top corners are on the screen edge, so both are
+# square and must sit exactly at y=0 at x=0 and x=width.
+top = [(c[i], c[i + 1]) for i in range(0, len(c), 2) if abs(c[i + 1]) < 1e-6]
+assert (0.0, 0.0) in [(round(x, 6), round(y, 6)) for x, y in top], top
+assert (380.0, 0.0) in [(round(x, 6), round(y, 6)) for x, y in top], top
+# every point stays inside the box, and the bottom corners are pulled in
 assert min(c[0::2]) >= 0 and max(c[0::2]) <= 380
-assert c[-2] == 0, c[-4:]                              # last point back at x1
+assert min(c[1::2]) >= 0 and max(c[1::2]) <= 52
+bottom = [y for y in c[1::2] if y > 52 - 14 - 1]
+assert bottom, "no bottom-corner points: the bottom is not rounded"
 
 # --- waveform bars -------------------------------------------------------------
 # own canvas inside the text frame, one rounded line per bar
@@ -555,6 +561,69 @@ by_text = {lbl.cget("text"): lbl for lbl in ov.lines}
 assert set(by_text) >= {"a", "b", "c"}, by_text.keys()
 assert by_text["c"].winfo_y() == 2 * ov.row_h(), by_text["c"].winfo_y()
 assert by_text["a"].winfo_y() == 0, by_text["a"].winfo_y()
+
+# --- position anchors ----------------------------------------------------------
+# Every anchor must place the window on the matching screen edge/corner, and
+# the shape must stay square on the edges that touch the screen: a bar pinned
+# to a corner is flush on two sides, so it keeps one rounded corner at most.
+sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+app.preset(nl.PRESET_CARD)                   # known 2-line card: 380x52
+root.update()
+W = nl.PRESET_CARD["width"]
+H = ov.row_h() * nl.PRESET_CARD["lines"]
+expect = {
+    "top-center":    (0, (sw - W) // 2, sw - W, (sw - W) // 2, 0),
+    "bottom-center": ((sw - W) // 2, 0, (sw - W) // 2, sw - W, sh - H),
+    "top-left":      (0, 0, 0, 0, 0),
+    "top-right":     (sw - W, 0, sw - W, 0, 0),
+    "bottom-left":   (0, 0, 0, 0, sh - H),
+    "bottom-right":  (sw - W, 0, sw - W, 0, sh - H),
+}
+for anchor in nl.ANCHORS:
+    app.vars["anchor"].set(anchor)
+    app.apply()
+    root.update()
+    g = ov.win.geometry()                       # WxH+X+Y
+    size, x, y = g.split("+")[0], int(g.split("+")[1]), int(g.split("+")[2])
+    assert size == "%dx%d" % (W, H), (anchor, g)
+    lo_x, hi_x = expect[anchor][0], expect[anchor][2]
+    assert min(lo_x, hi_x) <= x <= max(lo_x, hi_x), (anchor, g, x)
+    assert y == expect[anchor][4], (anchor, g, y)
+
+    # shape: corners on a flush edge must be square
+    p = [i for i in ov.canvas.find_all() if ov.canvas.type(i) == "polygon"][0]
+    c = ov.canvas.coords(p)
+    pts = {(round(c[i], 3), round(c[i + 1], 3)) for i in range(0, len(c), 2)}
+    vertical, _, horiz = anchor.partition("-")
+    if horiz in ("center", "left"):
+        assert (0.0, 0.0 if vertical == "top" else float(H)) in pts or \
+               (0.0, 0.0) in pts, (anchor, sorted(pts)[:4])
+    if vertical == "top":
+        assert (0.0, 0.0) in pts and (float(W), 0.0) in pts, (anchor, pts)
+    if vertical == "bottom":
+        assert (0.0, float(H)) in pts and (float(W), float(H)) in pts, (anchor, pts)
+    if horiz == "left":
+        assert (0.0, 0.0) in pts or (0.0, float(H)) in pts, (anchor, pts)
+    if horiz == "right":
+        assert (float(W), 0.0) in pts or (float(W), float(H)) in pts, (anchor, pts)
+    # and it never leaves its own box
+    assert min(c[0::2]) >= 0 and max(c[0::2]) <= W, (anchor, min(c[0::2]), max(c[0::2]))
+    assert min(c[1::2]) >= 0 and max(c[1::2]) <= H, (anchor, min(c[1::2]), max(c[1::2]))
+
+# corner anchors must actually round fewer corners than a centre anchor
+def rounded_count(anchor):
+    app.vars["anchor"].set(anchor)
+    app.apply()
+    root.update()
+    p = [i for i in ov.canvas.find_all() if ov.canvas.type(i) == "polygon"][0]
+    c = ov.canvas.coords(p)
+    return len({(round(c[i], 3), round(c[i + 1], 3)) for i in range(0, len(c), 2)})
+assert rounded_count("top-center") > rounded_count("top-left"), "corner not squarer"
+assert nl.notch_corners("top-center") == "brbl", nl.notch_corners("top-center")
+assert nl.notch_corners("top-left") == "br", nl.notch_corners("top-left")
+assert nl.notch_corners("bottom-right") == "tl", nl.notch_corners("bottom-right")
+# unknown anchor must not crash; it falls back
+assert nl.sanitize({"anchor": "nonsense"})["anchor"] == nl.DEFAULTS["anchor"]
 
 app.stop.set()
 root.destroy()

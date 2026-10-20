@@ -37,8 +37,9 @@ Everything is in the launcher window, and changes apply live:
 | Visible lines | 1 gives a single-line pill, 5 gives the Spotify panel |
 | Row height | pitch between rows; total height is row height × visible lines. If it is shorter than the font's ink box it is raised automatically so descenders (`g y p j`) are never clipped |
 | Width (px) | width of the block |
-| Top offset | vertical position (raise it to about 34 if the notch or taskbar covers the text) |
-| Horizontal offset | offset from horizontal center |
+| Top offset | fine vertical nudge on top of **Position** |
+| Horizontal offset | fine horizontal nudge on top of **Position** |
+| Position | where the bar sits on screen: `top-center` (the notch), `bottom-center`, or any of the four corners. The side that touches a screen edge is drawn square, so the shape always reads as cut into that edge — `top-center` rounds only the bottom corners, `top-left` keeps a single rounded corner. `Top offset` / `Horizontal offset` then nudge from there |
 | Font | dropdown of installed fonts, and the field is still editable |
 | Font size | size of every line. Emphasis comes from colour and position, not size, so the glyphs never have to be re-rasterised mid-glide |
 | Bold active line | bold for every line (the font must stay constant, see above) |
@@ -88,7 +89,8 @@ Verify the live SMTC session and real lyrics (a track must be playing):
 | `fetch_lyrics()` | `lrclib.net/api/search` → `syncedLyrics` (free, no API key); picks the version whose duration matches the playing track |
 | `parse_lrc()` | `[mm:ss.xx]text` → `[(seconds, text)]` |
 | `poll()` | background thread: track + position → `state["lines"]` and `state["idx"]` |
-| `Overlay.row_h()` | effective row pitch = `max(height, font linespace + 2)`; used by `apply()` and `render()` so no glyph is clipped |
+| `notch_corners()` | which corners stay rounded for a Position anchor: every corner not on a flush screen edge |
+| `notch_shape()` | screen-edge polygon, computed point by point; `rounded` names the corners that keep the radius |
 | `Overlay.set_art()` | decodes the PNG bytes from `art_png()` and (re)places the cover label; subsamples by powers of two to the requested size |
 | `round_rect()` | rounded rectangle as a smoothed polygon — Tk has no primitive for it |
 | `Overlay.render(pos)` | `pos` is a fractional line index; rows move per pixel, emphasis comes from `lerp_color(dim, fg, act)` only |
