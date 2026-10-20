@@ -174,6 +174,28 @@ def fetch_lyrics(title, artist, track_len=None):
 
 # ---------- now playing (SMTC) ----------
 
+def is_song(title, artist, length):
+    """Does this SMTC session look like a song rather than a video post?
+
+    A Brave tab playing an Instagram reel/live publishes the post's CAPTION as
+    the session title — often with no artist — so `artist` and `length` prove
+    nothing (songs arrive artist-less; reels run long). The title's SHAPE does:
+    a caption is prose (400+ chars, newlines, #hashtags, emoji); a song/video
+    title is short (<~240; all seven measured cases are <120) and plain.
+    """
+    t = (title or "").strip()
+    if not t:
+        return False
+    # Emoji blocks only. A blanket `ord(c) > 0x2100` would also reject CJK and
+    # Hangul titles, which are perfectly ordinary songs.
+    emoji = any(
+        0x1F300 <= ord(c) <= 0x1FAFF      # pictographs, emoticons, symbols
+        or 0x2600 <= ord(c) <= 0x27BF     # misc symbols + dingbats
+        for c in t
+    )
+    return len(t) <= 240 and "\n" not in t and "#" not in t and not emoji
+
+
 def _probe():
     from winsdk.windows.media.control import (
         GlobalSystemMediaTransportControlsSessionManager as Manager,
@@ -187,6 +209,9 @@ def _probe():
                 continue
             info = s.get_playback_info()
             tl = s.get_timeline_properties()
+            length = tl.end_time.total_seconds() if tl.end_time else 0.0
+            if not is_song(p.title, p.artist, length):
+                continue        # a video post's caption is not a song
             pos = tl.position.total_seconds()
             if tl.last_updated_time:
                 pos += (time.time() - tl.last_updated_time.timestamp())
@@ -194,7 +219,7 @@ def _probe():
                 "title": p.title,
                 "artist": p.artist or "",
                 "pos": max(pos, 0.0),
-                "len": tl.end_time.total_seconds() if tl.end_time else 0.0,
+                "len": length,
                 "playing": int(info.playback_status) == 4,
             }
         return None
@@ -668,6 +693,19 @@ if __name__ == "__main__":
         assert l[0] == (1.0, "satu") and l[1] == (12.5, "dua"), l
         l = parse_lrc("[by:5]\n[ar:123]\n[00:12.00][01:00.00]chorus\n")
         assert l == [(12.0, "chorus"), (60.0, "chorus")], l
+
+        # a video post publishes its caption as the session title; that is not a song
+        cap = ("(9+) Menceritakan dua penjaga minimarket yang shift malamnya berubah jadi "
+               "mimpi buruk. Genre: Comedy, Horror, Short Ratings: \u2b50 IMDb - 7.4/10 "
+               "\U0001f345 Rotten Tomatoes #RemainCalm #NontonFilm")
+        assert not is_song(cap, "", 68.2), cap
+        assert not is_song("lol cute \U0001f602 #reels", "", 15.0)
+        assert not is_song("", "Someone", 200.0)
+        # songs survive, including ones with no artist and non-Latin titles
+        assert is_song("Oceans & Engines", "", 336.0)
+        assert is_song("Patience", "Take That", 202.0)
+        assert is_song("\u591c\u306b\u99c6\u3051\u308b", "", 261.0)
+        assert is_song("\ubc24\ud3b8\uc9c0", "", 238.0)
 
         # garbage config must not produce a broken overlay
         s = sanitize({"width": "99999", "height": -5, "alpha": "x", "top": "abc",
