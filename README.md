@@ -32,7 +32,7 @@ Everything is in the launcher window, and changes apply live:
 
 | Control | Effect |
 |---|---|
-| **Preset: Spotify / Pill** | one click sets every field below to that style |
+| **Preset: Spotify / Pill / Card** | one click sets every field below to that style |
 | Source | which player to follow. The list is built from the SMTC sessions Windows is publishing right now, so every open player appears (`Brave`, `Spotify`, `msedge`, …) and idle ones are listed too. `Auto` follows whichever session is actually playing. The field is editable, so a player that is not running yet can still be typed in |
 | Visible lines | 1 gives a single-line pill, 5 gives the Spotify panel |
 | Row height | pitch between rows; total height is row height × visible lines. If it is shorter than the font's ink box it is raised automatically so descenders (`g y p j`) are never clipped |
@@ -40,12 +40,16 @@ Everything is in the launcher window, and changes apply live:
 | Top offset | vertical position (raise it to about 34 if the notch or taskbar covers the text) |
 | Horizontal offset | offset from horizontal center |
 | Font | dropdown of installed fonts, and the field is still editable |
-| Font size | size of the active line; every other line is 78% |
-| Bold active line | active line bold, the rest regular |
+| Font size | size of every line. Emphasis comes from colour and position, not size, so the glyphs never have to be re-rasterised mid-glide |
+| Bold active line | bold for every line (the font must stay constant, see above) |
 | Active line colour | white `#ffffff` by default |
 | Inactive line colour | grey `#b3b3b3` by default |
-| Background colour | used when the transparent background is disabled |
-| Transparent background | Windows colour-key transparency — only the text is visible |
+| Background colour | the card fill when the card is on, and the window fill when transparency is off |
+| Rounded card container | paints a rounded panel behind the lyrics |
+| Card radius | corner radius of that panel |
+| Card border colour | 1px outline around the card |
+| Show album art | draws the track's cover art from the Windows media session to the left of the lyrics |
+| Transparent background | Windows colour-key transparency — only the card and the text are visible |
 | Opacity | slider from 0.2 to 1.0 for the whole window |
 | Click-through | when disabled, the overlay becomes clickable |
 | Hide lyrics | toggles the overlay without closing the launcher |
@@ -83,9 +87,11 @@ Verify the live SMTC session and real lyrics (a track must be playing):
 | `parse_lrc()` | `[mm:ss.xx]text` → `[(seconds, text)]` |
 | `poll()` | background thread: track + position → `state["lines"]` and `state["idx"]` |
 | `Overlay.row_h()` | effective row pitch = `max(height, font linespace + 2)`; used by `apply()` and `render()` so no glyph is clipped |
-| `Overlay.render(pos)` | `pos` is a fractional line index; every row is offset per pixel while colour and size are interpolated from its distance to the playhead |
+| `Overlay.set_art()` | decodes the PNG bytes from `art_png()` and (re)places the cover label; subsamples by powers of two to the requested size |
+| `round_rect()` | rounded rectangle as a smoothed polygon — Tk has no primitive for it |
+| `Overlay.render(pos)` | `pos` is a fractional line index; rows move per pixel, emphasis comes from `lerp_color(dim, fg, act)` only |
 | `Overlay.animate_to()` | `after(16ms)` for ~260 ms, ease-out cubic — the playhead glides instead of jumping |
-| `Overlay.apply()` | geometry, alpha and font; `-transparentcolor` for the transparent background |
+| `Overlay.apply()` | geometry, alpha, card and font; `-transparentcolor` for the transparent background |
 | `App` | the launcher window; every field change calls `apply()` and updates the overlay |
 
 The transition works because `pos` is a float, not an integer. When the lyric
@@ -94,6 +100,18 @@ advances, `animate_to()` moves `pos` from 3.0 to 4.0 over 260 ms along the
 interpolates its colour from `dim` towards `fg` by `1 - |i - pos|`, so midway
 through the transition two adjacent lines are each half-bright — the same fade
 Spotify uses. A new track snaps rather than sliding out of the previous song.
+
+Emphasis is deliberately colour-only. An earlier version also interpolated the
+font size and toggled bold at 50 % brightness; Tk fonts are integer-sized, so a
+single glide produced exactly 5 distinct sizes, 33 weight flips and 160 font
+reconfigurations, and the text width jumped up to 84 px. That is what made the
+motion look stiff — not the framework. One constant font keeps the layout still
+and lets only the colour animate.
+
+On a card, the lyric labels carry the card colour instead of the colour key.
+`-transparentcolor` applies to the composited window, so a label painted in the
+key colour would punch a transparent hole through the card; the labels are also
+inset by the radius so their rectangles never cover the rounded corners.
 
 `bootstrap()` at the top of the file handles being opened by a Python that
 lacks `winsdk` (3.14, for instance): it relaunches itself with
@@ -117,5 +135,14 @@ lacks `winsdk` (3.14, for instance): it relaunches itself with
   of the file.
 - Transparency is colour-key based, so text that happens to be exactly
   `#010203` disappears with the background. The defaults are safe.
+- The colour key is 1-bit: the card can be rounded and filled, but it cannot
+  have a soft shadow, a glow or per-pixel alpha, and Tk's canvas has no
+  anti-aliasing, so the corners are stair-stepped when you zoom in. Real blur
+  needs a web view (`backdrop-filter`); a Tauri rewrite was measured and
+  rejected — no Rust/MSVC toolchain, ~4.5 GB of downloads, and its
+  click-through is all-or-nothing.
+- The cover art is downscaled with `PhotoImage.subsample`, which only divides by
+  whole numbers, so it is snapped to the nearest power of two and centred. No
+  resampling filter, no anti-aliasing.
 - Not packaged as an `.exe` yet — it needs Python 3.12 installed (`winsdk` has
   no 3.14 wheel).

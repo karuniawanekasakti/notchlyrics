@@ -8,6 +8,7 @@ Run:   double-click NotchLyrics.pyw
 Test:  .venv\\Scripts\\python.exe NotchLyrics.pyw --test
 """
 import asyncio
+import base64
 import ctypes
 import json
 import re
@@ -61,6 +62,11 @@ DEFAULTS = {
     "transparent": False,
     "clickthrough": True,
     "source": "Auto",
+    "card": False,
+    "radius": 20,
+    "card_edge": "#2c2c2c",
+    "art": False,
+    "art_size": 56,
 }
 
 # The Source dropdown lists whatever SMTC currently publishes, so it is built at
@@ -79,6 +85,28 @@ PRESET_SPOTIFY = {
     "dim": "#b3b3b3",
     "alpha": 1.0,
     "lines": 5,
+    "transparent": True,
+    "card": False,
+    "art": False,
+}
+
+# the "notch card": rounded container, album art, two lyric rows, one font size
+PRESET_CARD = {
+    "width": 900,
+    "height": 40,
+    "font_family": "Segoe UI",
+    "font_size": 19,
+    "bold": True,
+    "fg": "#ffffff",
+    "dim": "#9a9a9a",
+    "bg": "#101010",
+    "card_edge": "#2c2c2c",
+    "card": True,
+    "radius": 22,
+    "art": True,
+    "art_size": 56,
+    "alpha": 1.0,
+    "lines": 2,
     "transparent": True,
 }
 
@@ -245,10 +273,33 @@ def sessions():
                 "pos": max(pos, 0.0),
                 "len": tl.end_time.total_seconds() if tl.end_time else 0.0,
                 "playing": int(info.playback_status) == 4,
+                "thumb": p.thumbnail,          # stream ref, read lazily
             })
         return items
 
     return asyncio.run(go())
+
+
+def art_png(ref):
+    """Album art as PNG bytes. Read only when the track changes: the stream is
+    real I/O, so doing it on every poll tick would be wasteful."""
+    if ref is None:
+        return b""
+    from winsdk.windows.storage.streams import Buffer, DataReader, InputStreamOptions
+
+    async def go():
+        st = await ref.open_read_async()
+        buf = Buffer(st.size)
+        await st.read_async(buf, st.size, InputStreamOptions.NONE)
+        r = DataReader.from_buffer(buf)
+        out = bytearray(r.unconsumed_buffer_length)
+        r.read_bytes(out)
+        return bytes(out)
+
+    try:
+        return asyncio.run(go())
+    except Exception:
+        return b""
 
 
 def app_label(app):
@@ -298,6 +349,8 @@ def poll(state, stop, cfg=None):
                 last_key = key
                 fetched_at = time.monotonic()
                 lines = fetch_lyrics(np["title"], np["artist"], np["len"])
+                # cover is per track, so read it here and not on every tick
+                state["art"] = art_png(np.get("thumb"))
             i = None
             for idx, (t, _) in enumerate(lines):
                 if t <= np["pos"]:
@@ -315,6 +368,7 @@ def poll(state, stop, cfg=None):
         else:
             last_key, lines = "", []
             state["lines"], state["idx"] = [], None
+            state["art"] = b""
         stop.wait(0.3)
 
 
@@ -347,6 +401,12 @@ def sanitize(raw):
     d["source"] = d["source"].strip() if isinstance(d["source"], str) else DEFAULTS["source"]
     if not d["source"]:
         d["source"] = DEFAULTS["source"]
+    d["card"] = bool(d["card"])
+    d["art"] = bool(d["art"])
+    num("radius", 0, 200)
+    num("art_size", 16, 300)
+    d["card_edge"] = d["card_edge"] if isinstance(d["card_edge"], str) and \
+        re.fullmatch(r"#[0-9a-fA-F]{6}", d["card_edge"]) else DEFAULTS["card_edge"]
     for key in ("fg", "dim", "bg"):
         if not (isinstance(d[key], str) and d[key].startswith("#") and len(d[key]) == 7):
             d[key] = DEFAULTS[key]
@@ -380,6 +440,20 @@ def lerp_color(c1, c2, t):
     return "#%02x%02x%02x" % tuple(round(x + (y - x) * t) for x, y in zip(a, b))
 
 
+def round_rect(cv, x1, y1, x2, y2, r, **kw):
+    """Rounded rectangle as a spline-smoothed polygon. Tk ships no rounded
+    rectangle primitive, and smooth=True is the only way to get corners that
+    are not visibly stair-stepped."""
+    r = max(0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
+    if r <= 0:
+        return cv.create_rectangle(x1, y1, x2, y2, **kw)
+    pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+           x2, y2 - r, x2, y2, x2 - r, y2,
+           x1 + r, y2, x1, y2, x1, y2 - r,
+           x1, y1 + r, x1, y1]
+    return cv.create_polygon(pts, smooth=True, splinesteps=16, **kw)
+
+
 class Overlay:
     def __init__(self, root, cfg):
         self.cfg = cfg
@@ -391,11 +465,19 @@ class Overlay:
         self._anim_job = None
         self._from = self._to = 0.0
         self._t0 = 0.0
+        self._art_png = b""
+        self._art_size = 0
+        self._x0, self._w = 0, cfg["width"]
         self.win = tk.Toplevel(root)
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
+        # canvas first so a rounded card can be painted behind the text labels
+        self.canvas = tk.Canvas(self.win, highlightthickness=0, bd=0)
+        self.canvas.place(x=0, y=0, relwidth=1, relheight=1)
         self.box = tk.Frame(self.win)
-        self.box.pack(fill="both", expand=True)
+        self.box.place(x=0, y=0, relwidth=1, relheight=1)
+        self.art = None          # album-art label, only when art is enabled
+        self._art_key = None     # which track the current image belongs to
         self.win.bind("<Map>", lambda e: self._clickthrough())
         self.apply(cfg)
 
@@ -425,7 +507,42 @@ class Overlay:
             pass
         bg = MAGIC if cfg["transparent"] else cfg["bg"]
         self.win.configure(bg=bg)
+
+        # --- rounded card, painted on the canvas behind the text -----------
+        # The canvas is placed before the text widgets, so it is already beneath
+        # them without any explicit stacking call.
+        self.canvas.delete("all")
+        self.canvas.configure(bg=bg, width=w, height=h)
+        if cfg["card"]:
+            # The card must fill the window edge to edge. With any inset the
+            # label rects (which start at y=0) stick out past the polygon's top
+            # and bottom edge and paint a square strip over the rounded shape.
+            round_rect(self.canvas, 0, 0, w, h, cfg["radius"],
+                       fill=cfg["bg"], outline=cfg["card_edge"], width=1)
+
+        # Colour key is applied to the composited window, so a label painted in
+        # MAGIC would punch a hole through the card down to the desktop. On a
+        # card the labels must carry the card colour instead, and they are inset
+        # by the radius so their rectangles never cover the rounded corners.
+        # The frame itself stays transparent, otherwise its full rect would paint
+        # square corners back over the rounded polygon.
+        lbl_bg = cfg["bg"] if cfg["card"] else bg
+        pad_x = cfg["radius"] if cfg["card"] else 0
         self.box.configure(bg=bg)
+
+        # --- album art -----------------------------------------------------
+        self._render_art(cfg)
+
+        # Lyric rows: geometry is computed once here and only re-used by
+        # render(), so the row rect (and its radius inset) can never be
+        # overridden by the animation frame.
+        self._x0 = pad_x
+        self._w = max(20, w - 2 * pad_x)
+        if cfg["art"] and self.art is not None:
+            aw = self.art.winfo_width() or 0
+            if aw:
+                self._x0 = aw + 16
+                self._w = max(20, w - self._x0 - pad_x)
 
         for lbl in self.lines:
             lbl.destroy()
@@ -433,17 +550,67 @@ class Overlay:
         # one extra row than the window shows, so a sliding block never leaves a
         # blank strip at the bottom edge
         for _ in range(max(1, cfg["lines"]) + 1):
-            lbl = tk.Label(self.box, text="", bg=bg, anchor="center", justify="center")
-            lbl.place(x=0, y=0, width=w, height=self.row_h())
+            lbl = tk.Label(self.box, text="", bg=lbl_bg, anchor="center", justify="center")
+            lbl.place(x=self._x0, y=0, width=self._w, height=self.row_h())
             self.lines.append(lbl)
         self.render(self.pos)
         self._clickthrough()
         self.win.after(300, self._clickthrough)   # Tk rewrites ex-style on map
 
+    def _render_art(self, cfg):
+        """Album art as a Tk image. PhotoImage only scales by integer factors, so
+        the source is halved repeatedly until it is close to art_size."""
+        if not cfg["art"]:
+            if self.art is not None:
+                self.art.destroy()
+                self.art = None
+            return
+        key = self._art_key
+        want = cfg["art_size"]
+        if self.art is not None and getattr(self, "_art_size", None) == want:
+            return
+        if self.art is not None:
+            self.art.destroy()
+            self.art = None
+        if not self._art_png:
+            return
+        try:
+            img = tk.PhotoImage(data=base64.b64encode(self._art_png).decode())
+        except tk.TclError:
+            return                       # not a format Tk can read (webp, etc.)
+        while img.width() > want * 2:
+            img = img.subsample(2, 2)
+        self._art_img = img              # keep a reference or Tk collects it
+        h = cfg["height"] * max(1, cfg["lines"])
+        # On a card the label must be card-coloured: a MAGIC background would
+        # punch a transparent rectangle around the cover, straight through the
+        # card, because the colour key applies to the composited window.
+        lbg = cfg["bg"] if cfg["card"] else self.box.cget("bg")
+        self.art = tk.Label(self.box, image=img, bg=lbg, bd=0)
+        self.art.place(x=10, y=(h - img.height()) // 2, width=img.width(),
+                       height=img.height())
+        self._art_size = want
+
+    def set_art(self, png):
+        """New track: swap the cover if it actually changed."""
+        if png == self._art_png:
+            return
+        self._art_png = png
+        if self.art is not None:
+            self.art.destroy()
+            self.art = None
+        self._art_size = 0
+        self.apply(self.cfg)
+
     def render(self, pos=None):
-        """Spotify-style, continuous: `pos` is a float line index. Labels slide
-        by pixel and each line's colour/size fades with its distance from the
-        playhead, so advancing a line is a glide instead of a jump."""
+        """Spotify-style, continuous: `pos` is a float line index.
+
+        Emphasis comes from colour and vertical position only, never from font
+        size or weight. Tk fonts are integer-sized, so interpolating the size
+        gave exactly 5 hard steps per glide and re-measured the glyphs 160 times
+        (text width jumped up to 84px) -- which is what made the motion look
+        stiff. One constant font means zero re-rasterising: only fill changes.
+        """
         cfg = self.cfg
         if pos is not None:
             self.pos = pos
@@ -453,15 +620,15 @@ class Overlay:
             return
 
         h = self.row_h()
-        w = cfg["width"]
         vis = max(1, cfg["lines"])
         pos = max(0.0, min(float(self.pos), len(self.texts) - 1))
         self.pos = pos                     # keep it clamped for the next glide
         # scroll so the playhead sits mid-block, clamped at both ends
         top = max(0.0, min(pos - (vis - 1) / 2, max(0, len(self.texts) - vis)))
         fg, dim = cfg["fg"], cfg["dim"]
-        size = cfg["font_size"]
-        small = max(6, round(size * 0.78))
+        font = (cfg["font_family"], cfg["font_size"],
+                "bold" if cfg["bold"] else "normal")
+        x0, w = getattr(self, "_x0", 0), getattr(self, "_w", cfg["width"])
         for lbl in self.lines:
             lbl.place_forget()
         for k, lbl in enumerate(self.lines):
@@ -469,13 +636,9 @@ class Overlay:
             if i >= len(self.texts):
                 break
             act = max(0.0, 1.0 - min(1.0, abs(i - pos)))   # 1 = playhead, 0 = 2+ away
-            lbl.configure(
-                text=self.texts[i],
-                fg=lerp_color(dim, fg, act),
-                font=(cfg["font_family"], round(small + (size - small) * act),
-                      "bold" if (cfg["bold"] and act > 0.5) else "normal"),
-            )
-            lbl.place(x=0, y=round((i - top) * h), width=w, height=h)
+            lbl.configure(text=self.texts[i], font=font,
+                          fg=lerp_color(dim, fg, act))
+            lbl.place(x=x0, y=round((i - top) * h), width=w, height=h)
 
     def animate_to(self, idx):
         """Glide the playhead from where it is to `idx` instead of snapping."""
@@ -543,7 +706,7 @@ class App:
             pass
 
         self.cfg = load_cfg()
-        self.state = {"lines": [], "idx": None}
+        self.state = {"lines": [], "idx": None, "art": b""}
         self.stop = threading.Event()
         self._save_job = None
 
@@ -610,6 +773,8 @@ class App:
                    command=lambda: self.preset(PRESET_SPOTIFY)).pack(side="left")
         ttk.Button(pr, text="Pill", width=9,
                    command=lambda: self.preset(PRESET_PILL)).pack(side="left", padx=4)
+        ttk.Button(pr, text="Card", width=9,
+                   command=lambda: self.preset(PRESET_CARD)).pack(side="left")
         r += 1
 
         # --- which player to follow: filled from the live SMTC session list ---
@@ -646,6 +811,18 @@ class App:
         color("Active line colour", "fg")
         color("Inactive line colour", "dim")
         color("Background colour", "bg")
+        color("Card border colour", "card_edge")
+
+        self.card_var = tk.BooleanVar(value=c["card"])
+        ttk.Checkbutton(f, text="Rounded card container", variable=self.card_var,
+                        command=self.apply).grid(row=r, column=0, columnspan=3, sticky="w", pady=3)
+        r += 1
+        entry("Card radius", "radius")
+
+        self.art_var = tk.BooleanVar(value=c["art"])
+        ttk.Checkbutton(f, text="Show album art", variable=self.art_var,
+                        command=self.apply).grid(row=r, column=0, columnspan=3, sticky="w", pady=3)
+        r += 1
 
         self.transparent = tk.BooleanVar(value=c["transparent"])
         ttk.Checkbutton(f, text="Transparent background (no box)", variable=self.transparent,
@@ -685,6 +862,12 @@ class App:
                 pass
         c["font_family"] = self.vars["font_family"].get().strip() or DEFAULTS["font_family"]
         c["source"] = self.vars["source"].get().strip() or DEFAULTS["source"]
+        c["art"] = self.art_var.get()
+        c["card"] = self.card_var.get()
+        try:
+            c["radius"] = int(float(self.vars["radius"].get()))
+        except (ValueError, tk.TclError):
+            pass
         c["alpha"] = round(self.alpha.get(), 2)
         c["bold"] = self.bold.get()
         c["transparent"] = self.transparent.get()
@@ -701,8 +884,11 @@ class App:
         try:
             self.cfg.update(sanitize({**self.cfg, **values}))
             c = self.cfg
-            for k in ("width", "height", "top", "x_off", "font_size", "lines", "font_family"):
+            for k in ("width", "height", "top", "x_off", "font_size", "lines",
+                      "font_family", "radius"):
                 self.vars[k].set(str(c[k]))
+            self.art_var.set(c["art"])
+            self.card_var.set(c["card"])
             self.bold.set(c["bold"])
             self.alpha.set(c["alpha"])
             self.transparent.set(c["transparent"])
@@ -734,6 +920,7 @@ class App:
 
     def tick_once(self):
         self.overlay.set_content(self.state["lines"], self.state["idx"])
+        self.overlay.set_art(self.state.get("art", b""))
 
     def quit(self):
         self.stop.set()

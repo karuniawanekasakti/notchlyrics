@@ -4,6 +4,7 @@ animates, and that a config written by the UI is read back.
 
     .venv\\Scripts\\python.exe test_ui.py
 """
+import base64
 import importlib.util
 import tempfile
 import threading
@@ -105,8 +106,9 @@ assert active[0] == "four" and active[2] == nl.DEFAULTS["fg"], active
 assert "28" in active[1] and "bold" in active[1], active
 for t, font, fg, y in (rows[0], rows[2]):
     assert fg == nl.DEFAULTS["dim"], fg
-    assert "normal" in font, font
-    assert "22" in font, font          # 28 * 0.78, rounded
+    # emphasis is colour only: one font for every row, so nothing re-rasterises
+    # mid-glide (that was the stiffness: 5 sizes + a fixed width jump of 84px)
+    assert font == active[1], (font, active[1])
 # each line sits one row height below the previous
 assert [r[3] for r in rows] == [0, row, 2 * row], [r[3] for r in rows]
 
@@ -149,15 +151,10 @@ blend = shown()
 assert len(blend) == 3, blend
 
 
-def px(font):
-    """'{Segoe UI} 24 normal' -> 24"""
-    return int(font.split("} ")[1].split()[0])
-
-
 for t, font, fg, y in blend:
     if t in ("four", "five"):
         assert fg not in (nl.DEFAULTS["fg"], nl.DEFAULTS["dim"]), (t, fg)
-        assert 22 < px(font) < 28, (t, font)
+        assert font == blend[0][1], (t, font)   # colour carries the blend, not size
 
 # --- clamping at the ends ---
 app.state["lines"], app.state["idx"] = ["one", "two", "three", "four"], 0
@@ -386,6 +383,66 @@ after = list(app.source_box.cget("values"))
 nl.sessions = real_sessions
 assert "Brave" in after and "Spotify" in after, after
 print(f"source dropdown: {before} -> {after}")
+
+# --- card preset: rounded container + album art --------------------------------
+app.preset(nl.PRESET_CARD)
+root.update()
+print("card preset:", ov.win.geometry(), "items:", len(ov.canvas.find_all()),
+      "art:", ov.art is not None)
+
+# the rounded polygon really is on the canvas, and it is a smooth polygon not a rect
+items = ov.canvas.find_all()
+kinds = [ov.canvas.type(i) for i in items]
+assert "polygon" in kinds, kinds
+assert ov.win.geometry().startswith("900x80+510+0"), ov.win.geometry()   # 40 * 2
+assert app.vars["radius"].get() == "22", app.vars["radius"].get()
+
+# labels must NOT be painted in the colour key, or the card gets a hole punched
+# through it; they must be inset by the radius so corners stay rounded
+key = nl.MAGIC
+for lbl in ov.lines:
+    assert lbl.cget("bg") != key, lbl.cget("bg")
+assert ov.box.cget("bg") == key, ov.box.cget("bg")
+app.state["lines"], app.state["idx"] = ["one", "two", "three"], 1
+app.tick_once()
+settle()
+x_positions = {lbl.winfo_x() for lbl in ov.lines if lbl.winfo_ismapped()}
+assert x_positions and min(x_positions) >= 22, x_positions
+
+# a real image: 1x1 GIF, the smallest thing Tk is guaranteed to decode
+tiny = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
+ov.set_art(tiny)
+root.update()
+assert ov.art is not None, "art was not drawn"
+assert ov.art.winfo_x() >= 0 and ov.art.winfo_width() > 0
+assert ov._art_png == tiny
+
+# garbage art must not break the overlay
+ov.set_art(b"not a png")
+root.update()
+assert ov.art is None
+
+# turning art off removes it and gives the text the full width back
+app.art_var.set(False)
+app.apply()
+root.update()
+assert ov.art is None
+app.art_var.set(True)
+app.apply()
+root.update()
+
+# card off -> no polygon, labels back on the colour key
+app.card_var.set(False)
+app.apply()
+root.update()
+assert "polygon" not in [ov.canvas.type(i) for i in ov.canvas.find_all()]
+assert ov.lines[0].cget("bg") == key, ov.lines[0].cget("bg")
+
+# and the settings round-trip through the file
+app.preset(nl.PRESET_CARD)
+app.save()
+back = nl.load_cfg()
+assert back["card"] is True and back["art"] is True and back["radius"] == 22, back
 
 app.stop.set()
 root.destroy()
