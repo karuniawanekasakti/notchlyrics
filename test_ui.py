@@ -376,6 +376,17 @@ back = nl.load_cfg()
 assert back["width"] == 1111 and back["lines"] == 4, back
 assert back["source"] == "Spotify", back
 
+# --- Source dropdown is filled from live SMTC sessions ---
+fake = [{"app": "Spotify.exe"}, {"app": "Brave"}]
+real_sessions = nl.sessions
+nl.sessions = lambda: fake
+before = list(app.source_box.cget("values"))
+app.source_box.tk.call(app.source_box.cget("postcommand"))   # what opening the list does
+after = list(app.source_box.cget("values"))
+nl.sessions = real_sessions
+assert "Brave" in after and "Spotify" in after, after
+print(f"source dropdown: {before} -> {after}")
+
 app.stop.set()
 root.destroy()
 nl.CONFIG.unlink(missing_ok=True)

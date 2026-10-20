@@ -33,6 +33,7 @@ Everything is in the launcher window, and changes apply live:
 | Control | Effect |
 |---|---|
 | **Preset: Spotify / Pill** | one click sets every field below to that style |
+| Source | which player to follow. The list is built from the SMTC sessions Windows is publishing right now, so every open player appears (`Brave`, `Spotify`, `msedge`, …) and idle ones are listed too. `Auto` follows whichever session is actually playing. The field is editable, so a player that is not running yet can still be typed in |
 | Visible lines | 1 gives a single-line pill, 5 gives the Spotify panel |
 | Row height | pitch between rows; total height is row height × visible lines. If it is shorter than the font's ink box it is raised automatically so descenders (`g y p j`) are never clipped |
 | Width (px) | width of the block |
@@ -74,7 +75,10 @@ Verify the live SMTC session and real lyrics (a track must be playing):
 
 | Component | Responsibility |
 |---|---|
-| `_probe()` | `winsdk` → `GlobalSystemMediaTransportControlsSessionManager`; reads title, artist, playback position and status |
+| `sessions()` | every SMTC session on the machine, songs and non-songs alike — feeds both the overlay and the Source dropdown |
+| `app_names()` | `Auto` + one label per live session (`Spotify.exe` → `Spotify`, `PackageFamily!AppId` → `AppId`); returns just `Auto` if SMTC is unavailable |
+| `pick_session()` | playing wins over paused, then an optional case-insensitive app-id filter from the Source setting |
+| `_probe()` | `sessions()` filtered by `is_song()` and handed to `pick_session()` |
 | `fetch_lyrics()` | `lrclib.net/api/search` → `syncedLyrics` (free, no API key); picks the version whose duration matches the playing track |
 | `parse_lrc()` | `[mm:ss.xx]text` → `[(seconds, text)]` |
 | `poll()` | background thread: track + position → `state["lines"]` and `state["idx"]` |

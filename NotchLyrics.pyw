@@ -63,10 +63,9 @@ DEFAULTS = {
     "source": "Auto",
 }
 
-# Which SMTC session to follow. Matching is case-insensitive on the session's
-# app id, so "edge" matches msedge.exe and "spotify" matches Spotify.exe. The
-# launcher's dropdown is editable: type any fragment of an app id.
-SOURCES = ("Auto", "Brave", "Chrome", "Edge", "Spotify")
+# The Source dropdown lists whatever SMTC currently publishes, so it is built at
+# runtime by app_names(). It stays editable: typing any fragment of an app id
+# works too, even for a player that is not running yet.
 
 # Spotify's lyrics panel: several lines, current one white + bold + bigger,
 # neighbours muted grey, no background box at all.
@@ -219,7 +218,12 @@ def pick_session(items, source="Auto"):
     return sorted(items, key=lambda i: not i["playing"])[0]
 
 
-def _probe(source="Auto"):
+def sessions():
+    """Every SMTC session on the machine, song or not, newest order preserved.
+
+    Split out so the Source dropdown can list players that are open but idle
+    (a paused Spotify still publishes a session, sometimes without a title).
+    """
     from winsdk.windows.media.control import (
         GlobalSystemMediaTransportControlsSessionManager as Manager,
     )
@@ -229,27 +233,46 @@ def _probe(source="Auto"):
         items = []
         for s in mgr.get_sessions():
             p = await s.try_get_media_properties_async()
-            if not p.title:
-                continue
             info = s.get_playback_info()
             tl = s.get_timeline_properties()
-            length = tl.end_time.total_seconds() if tl.end_time else 0.0
-            if not is_song(p.title, p.artist, length):
-                continue        # a video post's caption is not a song
             pos = tl.position.total_seconds()
             if tl.last_updated_time:
                 pos += (time.time() - tl.last_updated_time.timestamp())
             items.append({
                 "app": s.source_app_user_model_id or "",
-                "title": p.title,
+                "title": p.title or "",
                 "artist": p.artist or "",
                 "pos": max(pos, 0.0),
-                "len": length,
+                "len": tl.end_time.total_seconds() if tl.end_time else 0.0,
                 "playing": int(info.playback_status) == 4,
             })
-        return pick_session(items, source)
+        return items
 
     return asyncio.run(go())
+
+
+def app_label(app):
+    """'Spotify.exe' -> 'Spotify'. The label is a substring of the session's
+    app id, so pick_session's filter matches what the dropdown shows."""
+    b = (app or "").rsplit("\\", 1)[-1].strip()
+    if "!" in b:                 # packaged app: PackageFamily!AppId -> AppId
+        b = b.split("!", 1)[1]
+    return b[:-4] if b.lower().endswith(".exe") else b
+
+
+def app_names():
+    """Dropdown values: Auto plus every player SMTC currently knows about."""
+    try:
+        apps = {app_label(i["app"]) for i in sessions() if i["app"]}
+    except Exception:
+        apps = set()          # SMTC unavailable -> dropdown still offers Auto
+    return ["Auto"] + sorted(apps, key=str.lower)
+
+
+def _probe(source="Auto"):
+    items = [i for i in sessions()
+             if is_song(i["title"], i["artist"], i["len"])]  # a video's caption is not a song
+    return pick_session(items, source)
 
 
 def poll(state, stop, cfg=None):
@@ -589,11 +612,12 @@ class App:
                    command=lambda: self.preset(PRESET_PILL)).pack(side="left", padx=4)
         r += 1
 
-        # --- which player to follow ---
+        # --- which player to follow: filled from the live SMTC session list ---
         ttk.Label(f, text="Source").grid(row=r, column=0, sticky="w", pady=3)
         self.vars["source"] = tk.StringVar(value=c["source"])
-        src = ttk.Combobox(f, textvariable=self.vars["source"], values=list(SOURCES),
-                           width=24)
+        src = ttk.Combobox(f, textvariable=self.vars["source"], values=app_names(),
+                           width=24, postcommand=lambda: src.configure(values=app_names()))
+        self.source_box = src
         src.grid(row=r, column=1, columnspan=2, sticky="w", padx=(10, 0))
         self.vars["source"].trace_add("write", lambda *_: self.apply())
         r += 1
@@ -756,6 +780,23 @@ if __name__ == "__main__":
         assert pick_session([a, b], "spotify")["app"] == "Spotify.exe"
         assert pick_session([a, b], "msedge") is None          # no such source -> nothing
         assert pick_session([], "Auto") is None
+
+        # dropdown labels come from the live session list, not a hardcoded tuple
+        assert app_label("Spotify.exe") == "Spotify"
+        assert app_label("msedge.exe") == "msedge" and app_label("") == ""
+        assert app_label(r"C:\Apps\vlc.exe") == "vlc"
+        assert app_label("Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic") == \
+            "Microsoft.ZuneMusic"
+        real = sessions
+        try:
+            globals()["sessions"] = lambda: [
+                {"app": "Spotify.exe"}, {"app": "Brave"}, {"app": "Brave"}, {"app": ""}]
+            assert app_names() == ["Auto", "Brave", "Spotify"], app_names()
+            globals()["sessions"] = lambda: (_ for _ in ()).throw(RuntimeError)
+            assert app_names() == ["Auto"]   # SMTC dead -> launcher still usable
+        finally:
+            globals()["sessions"] = real
+
         assert sanitize({"source": "  "})["source"] == "Auto"
         assert sanitize({"source": None})["source"] == "Auto"
 
