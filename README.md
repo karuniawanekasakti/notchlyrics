@@ -97,8 +97,14 @@ lacks `winsdk` (3.14, for instance): it relaunches itself with
 
 ## Known limits
 
-- A fully minimized Brave sometimes drops its SMTC session; lyrics stay empty
-  until a tab is focused again.
+- Brave keeps its SMTC session while the window is minimized, but reports a
+  frozen timeline (`position` stays at 0.01 s, `last_updated_time` at the moment
+  it lost focus). Position is extrapolated from that anchor, so lyrics keep
+  tracking normally; only a pause or seek performed while minimized can leave
+  the anchor stale until playback controls next update the session. Tab focus is
+  irrelevant — SMTC is per application, not per tab.
+- If the player drops the session entirely (Brave closed, playback stopped),
+  lyrics disappear until a new session appears.
 - Tracks with no synced lyrics on lrclib fall back to `♪ title — artist`.
 - Multi-monitor: the overlay is always on the primary display.
 - Lyrics about 0.3 s ahead of the vocal? There is no offset control yet.
