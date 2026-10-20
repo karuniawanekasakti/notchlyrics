@@ -39,7 +39,7 @@ Everything is in the launcher window, and changes apply live:
 | Width (px) | width of the block |
 | Top offset | fine vertical nudge on top of **Position** |
 | Horizontal offset | fine horizontal nudge on top of **Position** |
-| Position | where the bar sits on screen: `top-center` (the notch), `bottom-center`, or any of the four corners. The side that touches a screen edge is drawn square, so the shape always reads as cut into that edge — `top-center` rounds only the bottom corners, `top-left` keeps a single rounded corner. `Top offset` / `Horizontal offset` then nudge from there |
+| Position | where the bar sits on screen: `top-center` (the notch), `bottom-center`, or any of the four corners. Anchors are resolved against the screen's work area, so the top edge sits flush at `y=0` and the bottom edge stops just above the Windows taskbar instead of hiding under it. The side that touches a screen edge is drawn square, so the shape always reads as cut into that edge — `top-center` rounds only the bottom corners, `top-left` keeps a single rounded corner. `Top offset` / `Horizontal offset` then nudge from there |
 | Font | dropdown of installed fonts, and the field is still editable |
 | Font size | size of every line. Emphasis comes from colour and position, not size, so the glyphs never have to be re-rasterised mid-glide |
 | Bold active line | bold for every line (the font must stay constant, see above) |
@@ -89,13 +89,15 @@ Verify the live SMTC session and real lyrics (a track must be playing):
 | `fetch_lyrics()` | `lrclib.net/api/search` → `syncedLyrics` (free, no API key); picks the version whose duration matches the playing track |
 | `parse_lrc()` | `[mm:ss.xx]text` → `[(seconds, text)]` |
 | `poll()` | background thread: track + position → `state["lines"]` and `state["idx"]` |
+| `screen_work()` | primary monitor's work area via `SystemParametersInfoW(SPI_GETWORKAREA)` — the screen minus the taskbar, on any side. Returns `None` if Windows reports nothing, and the caller falls back to the raw screen |
+| `anchor_xy()` | anchor + work area → top-left pixel. The single place that knows top edge is `work.top` and bottom edge is `work.bottom - h` |
 | `notch_corners()` | which corners stay rounded for a Position anchor: every corner not on a flush screen edge |
 | `notch_shape()` | screen-edge polygon, computed point by point; `rounded` names the corners that keep the radius |
 | `Overlay.set_art()` | decodes the PNG bytes from `art_png()` and (re)places the cover label; subsamples by powers of two to the requested size |
 | `round_rect()` | rounded rectangle as a smoothed polygon — Tk has no primitive for it |
 | `Overlay.render(pos)` | `pos` is a fractional line index; rows move per pixel, emphasis comes from `lerp_color(dim, fg, act)` only |
 | `Overlay.animate_to()` | `after(16ms)` for ~260 ms, ease-out cubic — the playhead glides instead of jumping |
-| `Overlay.apply()` | geometry, alpha, card and font; `-transparentcolor` for the transparent background |
+| `Overlay.apply()` | geometry from `screen_work()` + `anchor_xy()` (work area minus taskbar, so bottom anchors clear the taskbar), alpha, card and font; `-transparentcolor` for the transparent background |
 | `App` | the launcher window; every field change calls `apply()` and updates the overlay |
 
 The transition works because `pos` is a float, not an integer. When the lyric

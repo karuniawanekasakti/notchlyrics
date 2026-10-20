@@ -10,6 +10,7 @@ Test:  .venv\\Scripts\\python.exe NotchLyrics.pyw --test
 import asyncio
 import base64
 import ctypes
+import ctypes.wintypes
 import json
 import math
 import re
@@ -34,6 +35,39 @@ _TABS = (0.0, [])       # (monotonic stamp, tab list) cache for browser_tabs()
 # cut into that edge, not a card floating next to it.
 ANCHORS = ("top-center", "bottom-center",
            "top-left", "top-right", "bottom-left", "bottom-right")
+
+
+def screen_work():
+    """(left, top, right, bottom) of the primary monitor minus the taskbar.
+
+    winfo_screenheight() counts the strip the taskbar covers, so a bottom
+    anchor that used it put the bar underneath the taskbar. Falls back to the
+    bare screen rect when the taskbar reports nothing (hidden/auto-hide)."""
+    try:
+        r = ctypes.wintypes.RECT()
+        ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(r), 0)
+        if r.right > r.left and r.bottom > r.top:
+            return r.left, r.top, r.right, r.bottom
+    except Exception:
+        pass
+    return None
+
+
+def anchor_xy(anchor, sw, sh, w, h, work=None):
+    """Top-left corner for `anchor` on an sw x sh screen.
+
+    `work` is the usable rect (left, top, right, bottom) — the screen minus the
+    taskbar. All four edges are honoured, so a taskbar on any side is avoided:
+    the top edge is work.top, the bottom edge is work.bottom - h.
+    """
+    if not work:
+        work = (0, 0, sw, sh)
+    left, top, right, bottom = work
+    ay, _, ax = anchor.partition("-")          # 'top-center' -> top, center
+    x = {"left": left, "center": left + (right - left - w) // 2,
+         "right": right - w}[ax]
+    y = {"top": top, "bottom": bottom - h}[ay]
+    return x, y
 
 
 def bootstrap():
@@ -716,12 +750,12 @@ class Overlay:
                         weight="bold" if cfg["bold"] else "normal")
         self._row = max(cfg["height"], f.metrics("linespace") + 2)
         h = self._row * max(1, cfg["lines"])
-        # anchor picks the corner/edge the bar is pinned to; top/x_off stay as
-        # fine offsets on top of it, so an existing config keeps working.
+        # Anchors resolve against the work area, not the raw screen: the top
+        # edge stays at 0 while the bottom edge stops above the taskbar
+        # instead of sliding under it.
         sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
-        ay, _, ax = cfg["anchor"].partition("-")   # 'top-center' -> top, center
-        x = {"left": 0, "center": (sw - w) // 2, "right": sw - w}[ax] + cfg["x_off"]
-        y = {"top": 0, "bottom": sh - h}[ay] + cfg["top"]
+        x, y = anchor_xy(cfg["anchor"], sw, sh, w, h, screen_work())
+        x, y = x + cfg["x_off"], y + cfg["top"]
         self.win.geometry(f"{w}x{h}+{x}+{y}")
         self.win.attributes("-alpha", cfg["alpha"])
         self.win.configure(bg=cfg["bg"])
@@ -1432,6 +1466,31 @@ if __name__ == "__main__":
         assert bad["fg"] == DEFAULTS["fg"] and bad["dim"] == DEFAULTS["dim"], bad
         assert bad["bg"] == DEFAULTS["bg"], bad
         assert sanitize({}) == DEFAULTS
+
+        # anchors sit on the work area: bottom anchors stop above the taskbar,
+        # and a taskbar on any other side is avoided too. (Tk is not started
+        # here; live geometry is test_ui.py's job.)
+        try:
+            globals()["screen_work"] = lambda: (0, 0, 1920, 1040)   # 40px bottom taskbar
+            assert screen_work() == (0, 0, 1920, 1040)
+            work = (0, 0, 1920, 1040)
+            assert anchor_xy("bottom-left", 1920, 1080, 34, 34, work) == (0, 1006)
+            assert anchor_xy("bottom-right", 1920, 1080, 34, 34, work) == (1886, 1006)
+            assert anchor_xy("bottom-center", 1920, 1080, 34, 34, work) == (943, 1006)
+            assert anchor_xy("top-center", 1920, 1080, 34, 34, work) == (943, 0)
+            assert anchor_xy("top-left", 1920, 1080, 34, 34, work) == (0, 0)
+            # taskbar on top, and on the left: the work area, not the screen,
+            # decides every edge
+            top_bar = (0, 40, 1920, 1080)
+            assert anchor_xy("top-left", 1920, 1080, 34, 34, top_bar) == (0, 40)
+            assert anchor_xy("bottom-right", 1920, 1080, 34, 34, top_bar) == (1886, 1046)
+            left_bar = (60, 0, 1920, 1080)
+            assert anchor_xy("top-left", 1920, 1080, 34, 34, left_bar) == (60, 0)
+            assert anchor_xy("bottom-center", 1920, 1080, 34, 34, left_bar) == (973, 1046)
+            # no work area (hidden taskbar / non-Windows) falls back to the screen
+            assert anchor_xy("bottom-left", 1920, 1080, 34, 34, None) == (0, 1046)
+        finally:
+            globals()["screen_work"] = real
 
         # config roundtrip: what the UI writes is what the next launch reads
         import tempfile

@@ -36,6 +36,7 @@ nl.poll = lambda state, stop, cfg=None: None
 if sys.platform != "win32":
     nl.sessions = lambda: []         # no SMTC: the Source dropdown just offers Auto
     nl.Overlay._clickthrough = lambda self: None    # ctypes.windll only exists on Windows
+    nl.screen_work = lambda: None                   # no SystemParametersInfoW outside Windows
 
 app = nl.App()
 root = app.root
@@ -571,14 +572,12 @@ app.preset(nl.PRESET_CARD)                   # known 2-line card: 380x52
 root.update()
 W = nl.PRESET_CARD["width"]
 H = ov.row_h() * nl.PRESET_CARD["lines"]
-expect = {
-    "top-center":    (0, (sw - W) // 2, sw - W, (sw - W) // 2, 0),
-    "bottom-center": ((sw - W) // 2, 0, (sw - W) // 2, sw - W, sh - H),
-    "top-left":      (0, 0, 0, 0, 0),
-    "top-right":     (sw - W, 0, sw - W, 0, 0),
-    "bottom-left":   (0, 0, 0, 0, sh - H),
-    "bottom-right":  (sw - W, 0, sw - W, 0, sh - H),
-}
+# Anchors resolve against the work area, so the expectation must come from the
+# same function; otherwise this test would happily accept a bar under the
+# taskbar. A fake 48px taskbar makes the difference visible even on a machine
+# whose taskbar is hidden.
+real_work = nl.screen_work
+nl.screen_work = lambda: (0, 0, sw, sh - 48)
 for anchor in nl.ANCHORS:
     app.vars["anchor"].set(anchor)
     app.apply()
@@ -586,9 +585,14 @@ for anchor in nl.ANCHORS:
     g = ov.win.geometry()                       # WxH+X+Y
     size, x, y = g.split("+")[0], int(g.split("+")[1]), int(g.split("+")[2])
     assert size == "%dx%d" % (W, H), (anchor, g)
-    lo_x, hi_x = expect[anchor][0], expect[anchor][2]
-    assert min(lo_x, hi_x) <= x <= max(lo_x, hi_x), (anchor, g, x)
-    assert y == expect[anchor][4], (anchor, g, y)
+    want_x, want_y = nl.anchor_xy(anchor, sw, sh, W, H, nl.screen_work())
+    assert (x, y) == (want_x, want_y), (anchor, g, want_x, want_y)
+    # the bottom edge must never reach under the taskbar
+    vertical, _, horiz = anchor.partition("-")
+    if vertical == "bottom":
+        assert y + H == sh - 48, (anchor, y + H, sh - 48)
+    else:
+        assert y == 0, (anchor, y)
 
     # shape: corners on a flush edge must be square
     p = [i for i in ov.canvas.find_all() if ov.canvas.type(i) == "polygon"][0]
@@ -624,6 +628,7 @@ assert nl.notch_corners("top-left") == "br", nl.notch_corners("top-left")
 assert nl.notch_corners("bottom-right") == "tl", nl.notch_corners("bottom-right")
 # unknown anchor must not crash; it falls back
 assert nl.sanitize({"anchor": "nonsense"})["anchor"] == nl.DEFAULTS["anchor"]
+nl.screen_work = real_work
 
 app.stop.set()
 root.destroy()
