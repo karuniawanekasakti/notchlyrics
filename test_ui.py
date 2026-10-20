@@ -286,7 +286,7 @@ state = {"lines": [], "idx": None}
 stop = threading.Event()
 
 
-def probe_ok():
+def probe_ok(source="Auto"):
     return {"title": "T", "artist": "A", "pos": 5.0, "len": 200.0, "playing": True}
 
 
@@ -312,7 +312,7 @@ songs = {
 cur = {"s": "A"}
 
 
-def probe_switch():
+def probe_switch(source="Auto"):
     s = songs[cur["s"]]
     return {"title": s["title"], "artist": s["artist"], "pos": s["pos"],
             "len": s["len"], "playing": True}
@@ -368,11 +368,13 @@ assert ov.win.state() == "normal"
 # --- what the UI saved must come back on the next launch ---
 app.vars["width"].set("1111")
 app.vars["lines"].set("4")
+app.vars["source"].set("Spotify")
 app.apply()
 app.save()
 assert nl.CONFIG.exists(), "save wrote nothing"
 back = nl.load_cfg()
 assert back["width"] == 1111 and back["lines"] == 4, back
+assert back["source"] == "Spotify", back
 
 app.stop.set()
 root.destroy()

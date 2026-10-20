@@ -60,7 +60,13 @@ DEFAULTS = {
     "lines": 1,
     "transparent": False,
     "clickthrough": True,
+    "source": "Auto",
 }
+
+# Which SMTC session to follow. Matching is case-insensitive on the session's
+# app id, so "edge" matches msedge.exe and "spotify" matches Spotify.exe. The
+# launcher's dropdown is editable: type any fragment of an app id.
+SOURCES = ("Auto", "Brave", "Chrome", "Edge", "Spotify")
 
 # Spotify's lyrics panel: several lines, current one white + bold + bigger,
 # neighbours muted grey, no background box at all.
@@ -196,13 +202,31 @@ def is_song(title, artist, length):
     return len(t) <= 240 and "\n" not in t and "#" not in t and not emoji
 
 
-def _probe():
+def pick_session(items, source="Auto"):
+    """Choose which SMTC session the overlay follows.
+
+    `items` is one dict per session: app, title, artist, len, pos, playing.
+    Preference order: a playing session beats a paused one, and the user's
+    chosen source beats everything else. Without this a paused tab left open in
+    the tab strip could win over the song actually playing.
+    """
+    want = "" if (source or "").strip().lower() in ("", "auto") else source.strip().lower()
+    if want:
+        items = [i for i in items if want in i["app"].lower()]
+    if not items:
+        return None
+    # playing first, then keep the original (SMTC) order for stability
+    return sorted(items, key=lambda i: not i["playing"])[0]
+
+
+def _probe(source="Auto"):
     from winsdk.windows.media.control import (
         GlobalSystemMediaTransportControlsSessionManager as Manager,
     )
 
     async def go():
         mgr = await Manager.request_async()
+        items = []
         for s in mgr.get_sessions():
             p = await s.try_get_media_properties_async()
             if not p.title:
@@ -215,25 +239,26 @@ def _probe():
             pos = tl.position.total_seconds()
             if tl.last_updated_time:
                 pos += (time.time() - tl.last_updated_time.timestamp())
-            return {
+            items.append({
+                "app": s.source_app_user_model_id or "",
                 "title": p.title,
                 "artist": p.artist or "",
                 "pos": max(pos, 0.0),
                 "len": length,
                 "playing": int(info.playback_status) == 4,
-            }
-        return None
+            })
+        return pick_session(items, source)
 
     return asyncio.run(go())
 
 
-def poll(state, stop):
+def poll(state, stop, cfg=None):
     """Background thread: keeps state["lines"]/state["idx"] fresh."""
     last_key, lines = "", []
     fetched_at = 0.0
     while not stop.is_set():
         try:
-            np = _probe()
+            np = _probe((cfg or {}).get("source", "Auto"))
         except Exception:
             np = None
         if np:
@@ -296,6 +321,9 @@ def sanitize(raw):
     d["clickthrough"] = bool(d["clickthrough"])
     d["bold"] = bool(d["bold"])
     d["transparent"] = bool(d["transparent"])
+    d["source"] = d["source"].strip() if isinstance(d["source"], str) else DEFAULTS["source"]
+    if not d["source"]:
+        d["source"] = DEFAULTS["source"]
     for key in ("fg", "dim", "bg"):
         if not (isinstance(d[key], str) and d[key].startswith("#") and len(d[key]) == 7):
             d[key] = DEFAULTS[key]
@@ -505,7 +533,10 @@ class App:
         self.overlay = Overlay(self.root, self.cfg)
         self.tick()
 
-        threading.Thread(target=poll, args=(self.state, self.stop), daemon=True).start()
+        # cfg is shared by reference, so changing Source takes effect on the
+        # next poll tick without restarting
+        threading.Thread(target=poll, args=(self.state, self.stop, self.cfg),
+                         daemon=True).start()
         self.root.mainloop()
 
     # --- ui ---
@@ -556,6 +587,15 @@ class App:
                    command=lambda: self.preset(PRESET_SPOTIFY)).pack(side="left")
         ttk.Button(pr, text="Pill", width=9,
                    command=lambda: self.preset(PRESET_PILL)).pack(side="left", padx=4)
+        r += 1
+
+        # --- which player to follow ---
+        ttk.Label(f, text="Source").grid(row=r, column=0, sticky="w", pady=3)
+        self.vars["source"] = tk.StringVar(value=c["source"])
+        src = ttk.Combobox(f, textvariable=self.vars["source"], values=list(SOURCES),
+                           width=24)
+        src.grid(row=r, column=1, columnspan=2, sticky="w", padx=(10, 0))
+        self.vars["source"].trace_add("write", lambda *_: self.apply())
         r += 1
 
         # --- font: dropdown of installed families, still typeable ---
@@ -620,6 +660,7 @@ class App:
             except (ValueError, tk.TclError):
                 pass
         c["font_family"] = self.vars["font_family"].get().strip() or DEFAULTS["font_family"]
+        c["source"] = self.vars["source"].get().strip() or DEFAULTS["source"]
         c["alpha"] = round(self.alpha.get(), 2)
         c["bold"] = self.bold.get()
         c["transparent"] = self.transparent.get()
@@ -706,6 +747,17 @@ if __name__ == "__main__":
         assert is_song("Patience", "Take That", 202.0)
         assert is_song("\u591c\u306b\u99c6\u3051\u308b", "", 261.0)
         assert is_song("\ubc24\ud3b8\uc9c0", "", 238.0)
+
+        # source selection: playing beats paused, filter matches the app id
+        a = {"app": "Spotify.exe", "title": "A", "playing": False}
+        b = {"app": "Brave", "title": "B", "playing": True}
+        assert pick_session([a, b])["app"] == "Brave"          # playing wins over order
+        assert pick_session([a, b], "brave")["app"] == "Brave"    # case-insensitive
+        assert pick_session([a, b], "spotify")["app"] == "Spotify.exe"
+        assert pick_session([a, b], "msedge") is None          # no such source -> nothing
+        assert pick_session([], "Auto") is None
+        assert sanitize({"source": "  "})["source"] == "Auto"
+        assert sanitize({"source": None})["source"] == "Auto"
 
         # garbage config must not produce a broken overlay
         s = sanitize({"width": "99999", "height": -5, "alpha": "x", "top": "abc",
