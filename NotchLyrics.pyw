@@ -37,7 +37,11 @@ def bootstrap():
             return          # already the venv's interpreter (python.exe or pythonw.exe)
     except OSError:
         pass
-    subprocess.Popen([str(pyw), str(Path(__file__).resolve()), *sys.argv[1:]])
+    script = Path(__file__).resolve()
+    args = sys.argv[1:]
+    if args and Path(args[0]).resolve() == script:
+        args = args[1:]     # relaunched with the script path already in argv
+    subprocess.Popen([str(pyw), str(script), *args])
     sys.exit(0)
 
 
@@ -90,25 +94,28 @@ PRESET_PILL = {
 
 
 # ---------- lyrics ----------
+LRC_STAMP = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
+
 
 def parse_lrc(raw):
     """[mm:ss.xx]text -> [(seconds, text)] sorted."""
     out = []
     for row in raw.splitlines():
         row = row.strip()
-        if not row.startswith("["):
+        while row.startswith("[") and not LRC_STAMP.match(row):
+            close = row.find("]")
+            if close < 0:
+                break
+            row = row[close + 1:].strip()
+        stamps, end = [], 0
+        while (m := LRC_STAMP.match(row, end)):
+            stamps.append(m.groups())
+            end = m.end()
+        text = row[end:].strip()
+        if not text:
             continue
-        close = row.find("]")
-        if close < 0:
-            continue
-        stamp, text = row[1:close], row[close + 1:].strip()
-        mm, _, ss = stamp.partition(":")
-        try:
-            t = int(mm) * 60 + float(ss)
-        except ValueError:
-            continue
-        if text:
-            out.append((t, text))
+        for mm, ss in stamps:
+            out.append((int(mm) * 60 + float(ss), text))
     out.sort()
     return out
 
@@ -439,7 +446,7 @@ class Overlay:
         hwnd = ctypes.windll.user32.GetParent(self.win.winfo_id())
         style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
         want = (style | 0x20) if self.cfg["clickthrough"] else (style & ~0x20)
-        if want != style:
+        if want != style:      # want is derived from this same read, so this is exact
             ctypes.windll.user32.SetWindowLongW(hwnd, -20, want)
 
     def show(self, on):
@@ -659,6 +666,8 @@ if __name__ == "__main__":
         l = parse_lrc("[00:12.50]dua\n[00:01.00]satu\n[junk]\n[00:02.00]\n")
         assert len(l) == 2, l
         assert l[0] == (1.0, "satu") and l[1] == (12.5, "dua"), l
+        l = parse_lrc("[by:5]\n[ar:123]\n[00:12.00][01:00.00]chorus\n")
+        assert l == [(12.0, "chorus"), (60.0, "chorus")], l
 
         # garbage config must not produce a broken overlay
         s = sanitize({"width": "99999", "height": -5, "alpha": "x", "top": "abc",
