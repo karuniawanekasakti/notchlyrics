@@ -11,6 +11,7 @@ import asyncio
 import base64
 import ctypes
 import json
+import math
 import re
 import subprocess
 import sys
@@ -67,6 +68,11 @@ DEFAULTS = {
     "card_edge": "#2c2c2c",
     "art": False,
     "art_size": 56,
+    "align": "center",     # where the playhead sits: center or bottom
+    "notch": True,         # flush with the top edge: only bottom corners round
+    "viz": False,          # waveform bars at the right edge
+    "viz_color": "#0095f5",
+    "viz_bars": 4,
 }
 
 # The Source dropdown lists whatever SMTC currently publishes, so it is built at
@@ -90,23 +96,29 @@ PRESET_SPOTIFY = {
     "art": False,
 }
 
-# the "notch card": rounded container, album art, two lyric rows, one font size
+# the notch: flush with the top screen edge (flat top, rounded bottom corners),
+# album art on the left, two lyric rows, waveform bars on the right
 PRESET_CARD = {
-    "width": 900,
-    "height": 40,
+    "width": 380,
+    "height": 26,
     "font_family": "Segoe UI",
-    "font_size": 19,
+    "font_size": 11,
     "bold": True,
-    "fg": "#ffffff",
-    "dim": "#9a9a9a",
-    "bg": "#101010",
-    "card_edge": "#2c2c2c",
+    "fg": "#f5f5f5",
+    "dim": "#a5a5a5",
+    "bg": "#070707",
+    "card_edge": "#1c1c1c",
     "card": True,
-    "radius": 22,
+    "notch": True,
+    "radius": 14,
     "art": True,
-    "art_size": 56,
+    "art_size": 34,
     "alpha": 1.0,
     "lines": 2,
+    "align": "bottom",
+    "viz": True,
+    "viz_color": "#0095f5",
+    "viz_bars": 4,
     "transparent": True,
 }
 
@@ -403,11 +415,15 @@ def sanitize(raw):
         d["source"] = DEFAULTS["source"]
     d["card"] = bool(d["card"])
     d["art"] = bool(d["art"])
+    d["viz"] = bool(d["viz"])
+    d["notch"] = bool(d["notch"])
+    d["align"] = d["align"] if d["align"] in ("center", "bottom") else DEFAULTS["align"]
     num("radius", 0, 200)
     num("art_size", 16, 300)
+    num("viz_bars", 1, 12)
     d["card_edge"] = d["card_edge"] if isinstance(d["card_edge"], str) and \
         re.fullmatch(r"#[0-9a-fA-F]{6}", d["card_edge"]) else DEFAULTS["card_edge"]
-    for key in ("fg", "dim", "bg"):
+    for key in ("fg", "dim", "bg", "viz_color"):
         if not (isinstance(d[key], str) and d[key].startswith("#") and len(d[key]) == 7):
             d[key] = DEFAULTS[key]
     return d
@@ -438,6 +454,29 @@ def lerp_color(c1, c2, t):
     a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
     b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
     return "#%02x%02x%02x" % tuple(round(x + (y - x) * t) for x, y in zip(a, b))
+
+
+def notch_shape(cv, x1, y1, x2, y2, r, **kw):
+    """Notch: flat top flush with the screen edge, rounded bottom corners only.
+
+    The outline is computed here rather than with create_arc, because Tk's arc
+    angles are easy to get a quadrant wrong on, and a smooth=True polygon bows
+    the top edge (which makes it stop looking attached to the screen edge).
+    """
+    r = max(0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
+    pts = [(x1, y1), (x2, y1), (x2, y2 - r)]
+    steps = 8
+    for i in range(1, steps + 1):                 # bottom-right quarter
+        a = (math.pi / 2) * i / steps
+        pts.append((x2 - r + r * math.cos(a), y2 - r + r * math.sin(a)))
+    for i in range(1, steps + 1):                 # bottom-left quarter
+        a = (math.pi / 2) * (1 - i / steps)
+        pts.append((x1 + r - r * math.cos(a), y2 - r + r * math.sin(a)))
+    pts.append((x1, y2 - r))
+    flat = [c for p in pts for c in p]
+    return cv.create_polygon(flat, fill=kw.get("fill"),
+                             outline=kw.get("outline", ""),
+                             width=kw.get("width", 1))
 
 
 def round_rect(cv, x1, y1, x2, y2, r, **kw):
@@ -477,6 +516,7 @@ class Overlay:
         self.box = tk.Frame(self.win)
         self.box.place(x=0, y=0, relwidth=1, relheight=1)
         self.art = None          # album-art label, only when art is enabled
+        self.viz = None          # waveform canvas, only when viz is enabled
         self._art_key = None     # which track the current image belongs to
         self.win.bind("<Map>", lambda e: self._clickthrough())
         self.apply(cfg)
@@ -517,8 +557,15 @@ class Overlay:
             # The card must fill the window edge to edge. With any inset the
             # label rects (which start at y=0) stick out past the polygon's top
             # and bottom edge and paint a square strip over the rounded shape.
-            round_rect(self.canvas, 0, 0, w, h, cfg["radius"],
-                       fill=cfg["bg"], outline=cfg["card_edge"], width=1)
+            # notch = flush with the top screen edge, so only the bottom corners
+            # are rounded; that is what makes it read as a notch and not a
+            # floating card.
+            if cfg.get("notch", True):
+                notch_shape(self.canvas, 0, 0, w, h, cfg["radius"],
+                            fill=cfg["bg"], outline=cfg["card_edge"], width=1)
+            else:
+                round_rect(self.canvas, 0, 0, w, h, cfg["radius"],
+                           fill=cfg["bg"], outline=cfg["card_edge"], width=1)
 
         # Colour key is applied to the composited window, so a label painted in
         # MAGIC would punch a hole through the card down to the desktop. On a
@@ -533,6 +580,30 @@ class Overlay:
         # --- album art -----------------------------------------------------
         self._render_art(cfg)
 
+        # --- waveform bars at the right edge --------------------------------
+        # Own canvas, child of the text frame: the big canvas sits *behind* the
+        # frame, so anything drawn there is covered by the lyric labels.
+        # A vertical create_line with capstyle=round is a rounded bar; Tk has no
+        # rounded-rectangle primitive.
+        if getattr(self, "viz", None) is not None:
+            self.viz.destroy()
+            self.viz = None
+        self._viz_ids = []
+        self._viz_n = max(1, cfg["viz_bars"])
+        bw, gap = 3, 4
+        self._viz_gutter = (bw + gap) * self._viz_n + 10 if cfg["viz"] else 0
+        if cfg["viz"]:
+            gw = self._viz_gutter
+            self.viz = tk.Canvas(self.box, width=gw, height=h, bd=0,
+                                 highlightthickness=0, bg=lbl_bg)
+            self.viz.place(x=w - gw - max(0, pad_x - 6), y=0, width=gw, height=h)
+            x = gw - 10
+            for _ in range(self._viz_n):
+                self._viz_ids.append(self.viz.create_line(
+                    x, h // 2, x, h // 2, width=bw, capstyle="round",
+                    fill=cfg["viz_color"]))
+                x -= bw + gap
+
         # Lyric rows: geometry is computed once here and only re-used by
         # render(), so the row rect (and its radius inset) can never be
         # overridden by the animation frame.
@@ -541,8 +612,8 @@ class Overlay:
         if cfg["art"] and self.art is not None:
             aw = self.art.winfo_width() or 0
             if aw:
-                self._x0 = aw + 16
-                self._w = max(20, w - self._x0 - pad_x)
+                self._x0 = aw + 22
+        self._w = max(20, w - self._x0 - pad_x - self._viz_gutter)
 
         for lbl in self.lines:
             lbl.destroy()
@@ -556,6 +627,8 @@ class Overlay:
         self.render(self.pos)
         self._clickthrough()
         self.win.after(300, self._clickthrough)   # Tk rewrites ex-style on map
+        self._viz_stop()
+        self._viz_tick()
 
     def _render_art(self, cfg):
         """Album art as a Tk image. PhotoImage only scales by integer factors, so
@@ -581,12 +654,12 @@ class Overlay:
         while img.width() > want * 2:
             img = img.subsample(2, 2)
         self._art_img = img              # keep a reference or Tk collects it
-        h = cfg["height"] * max(1, cfg["lines"])
         # On a card the label must be card-coloured: a MAGIC background would
         # punch a transparent rectangle around the cover, straight through the
         # card, because the colour key applies to the composited window.
         lbg = cfg["bg"] if cfg["card"] else self.box.cget("bg")
         self.art = tk.Label(self.box, image=img, bg=lbg, bd=0)
+        h = self.row_h() * max(1, cfg["lines"])
         self.art.place(x=10, y=(h - img.height()) // 2, width=img.width(),
                        height=img.height())
         self._art_size = want
@@ -623,8 +696,11 @@ class Overlay:
         vis = max(1, cfg["lines"])
         pos = max(0.0, min(float(self.pos), len(self.texts) - 1))
         self.pos = pos                     # keep it clamped for the next glide
-        # scroll so the playhead sits mid-block, clamped at both ends
-        top = max(0.0, min(pos - (vis - 1) / 2, max(0, len(self.texts) - vis)))
+        # scroll so the playhead sits where the preset wants it, clamped at both ends
+        if cfg["align"] == "bottom":
+            top = max(0.0, min(pos - (vis - 1), max(0, len(self.texts) - vis)))
+        else:
+            top = max(0.0, min(pos - (vis - 1) / 2, max(0, len(self.texts) - vis)))
         fg, dim = cfg["fg"], cfg["dim"]
         font = (cfg["font_family"], cfg["font_size"],
                 "bold" if cfg["bold"] else "normal")
@@ -667,6 +743,39 @@ class Overlay:
                 self._anim_job = None
 
         step()
+
+    def _viz_tick(self):
+        """Animate the bars. Not real audio: WASAPI loopback returns silence on
+        this machine, so the shape is a phase-shifted sine per bar.
+        ponytail: synthetic. Swap in real levels when process-loopback capture
+        (ActivateAudioInterfaceAsync) is available."""
+        self._viz_job = None
+        if not self.cfg.get("viz") or not self._viz_ids:
+            return
+        h = self.row_h() * max(1, self.cfg["lines"])
+        if not self.texts:                 # nothing playing: bars rest short
+            for i in self._viz_ids:
+                x = self.viz.coords(i)[0]
+                self.viz.coords(i, x, h / 2 - 2, x, h / 2 + 2)
+            self._viz_job = self.win.after(250, self._viz_tick)
+            return
+        t = time.monotonic() * 3.4
+        for k, i in enumerate(self._viz_ids):
+            ph = t + k * 0.9
+            amp = 0.30 + 0.62 * abs(math.sin(ph) * math.cos(ph * 0.61 + k))
+            half = max(2.0, amp * (h - 14) / 2)
+            x = self.viz.coords(i)[0]
+            cy = h / 2
+            self.viz.coords(i, x, cy - half, x, cy + half)
+        self._viz_job = self.win.after(45, self._viz_tick)
+
+    def _viz_stop(self):
+        if getattr(self, "_viz_job", None):
+            try:
+                self.win.after_cancel(self._viz_job)
+            except tk.TclError:
+                pass
+            self._viz_job = None
 
     def set_content(self, texts, idx):
         if texts != self.texts:
@@ -824,6 +933,20 @@ class App:
                         command=self.apply).grid(row=r, column=0, columnspan=3, sticky="w", pady=3)
         r += 1
 
+        self.viz_var = tk.BooleanVar(value=c["viz"])
+        ttk.Checkbutton(f, text="Waveform bars (synthetic, not real audio)", variable=self.viz_var,
+                        command=self.apply).grid(row=r, column=0, columnspan=3, sticky="w", pady=3)
+        r += 1
+        entry("Waveform bars", "viz_bars")
+        color("Waveform colour", "viz_color")
+
+        ttk.Label(f, text="Active line position").grid(row=r, column=0, sticky="w", pady=3)
+        self.vars["align"] = tk.StringVar(value=c["align"])
+        ttk.Combobox(f, textvariable=self.vars["align"], values=("center", "bottom"),
+                     state="readonly", width=10).grid(row=r, column=1, sticky="w", padx=(10, 0))
+        self.vars["align"].trace_add("write", lambda *_: self.apply())
+        r += 1
+
         self.transparent = tk.BooleanVar(value=c["transparent"])
         ttk.Checkbutton(f, text="Transparent background (no box)", variable=self.transparent,
                         command=self.apply).grid(row=r, column=0, columnspan=3, sticky="w", pady=3)
@@ -864,6 +987,12 @@ class App:
         c["source"] = self.vars["source"].get().strip() or DEFAULTS["source"]
         c["art"] = self.art_var.get()
         c["card"] = self.card_var.get()
+        c["viz"] = self.viz_var.get()
+        c["align"] = self.vars["align"].get()
+        try:
+            c["viz_bars"] = int(float(self.vars["viz_bars"].get()))
+        except (ValueError, tk.TclError):
+            pass
         try:
             c["radius"] = int(float(self.vars["radius"].get()))
         except (ValueError, tk.TclError):
@@ -885,10 +1014,12 @@ class App:
             self.cfg.update(sanitize({**self.cfg, **values}))
             c = self.cfg
             for k in ("width", "height", "top", "x_off", "font_size", "lines",
-                      "font_family", "radius"):
+                      "font_family", "radius", "viz_bars"):
                 self.vars[k].set(str(c[k]))
             self.art_var.set(c["art"])
             self.card_var.set(c["card"])
+            self.viz_var.set(c["viz"])
+            self.vars["align"].set(c["align"])
             self.bold.set(c["bold"])
             self.alpha.set(c["alpha"])
             self.transparent.set(c["transparent"])

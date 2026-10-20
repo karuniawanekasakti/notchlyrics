@@ -390,12 +390,11 @@ root.update()
 print("card preset:", ov.win.geometry(), "items:", len(ov.canvas.find_all()),
       "art:", ov.art is not None)
 
-# the rounded polygon really is on the canvas, and it is a smooth polygon not a rect
+# the card really is painted, and the geometry matches the preset
 items = ov.canvas.find_all()
-kinds = [ov.canvas.type(i) for i in items]
-assert "polygon" in kinds, kinds
-assert ov.win.geometry().startswith("900x80+510+0"), ov.win.geometry()   # 40 * 2
-assert app.vars["radius"].get() == "22", app.vars["radius"].get()
+assert items, "nothing painted on the card canvas"
+assert ov.win.geometry().startswith("380x52+770+0"), ov.win.geometry()   # 26 * 2
+assert app.vars["radius"].get() == "14", app.vars["radius"].get()
 
 # labels must NOT be painted in the colour key, or the card gets a hole punched
 # through it; they must be inset by the radius so corners stay rounded
@@ -407,7 +406,7 @@ app.state["lines"], app.state["idx"] = ["one", "two", "three"], 1
 app.tick_once()
 settle()
 x_positions = {lbl.winfo_x() for lbl in ov.lines if lbl.winfo_ismapped()}
-assert x_positions and min(x_positions) >= 22, x_positions
+assert x_positions and min(x_positions) >= 14, x_positions
 
 # a real image: 1x1 GIF, the smallest thing Tk is guaranteed to decode
 tiny = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
@@ -442,7 +441,68 @@ assert ov.lines[0].cget("bg") == key, ov.lines[0].cget("bg")
 app.preset(nl.PRESET_CARD)
 app.save()
 back = nl.load_cfg()
-assert back["card"] is True and back["art"] is True and back["radius"] == 22, back
+assert back["card"] is True and back["art"] is True and back["radius"] == 14, back
+assert back["viz"] is True and back["viz_bars"] == 4 and back["align"] == "bottom", back
+assert back["notch"] is True, back
+
+# the notch shape: flat top edge, rounded bottom corners only. A smooth polygon
+# would bow the top too, so the first two vertices must both sit at y=0.
+polys = [i for i in ov.canvas.find_all() if ov.canvas.type(i) == "polygon"]
+assert len(polys) == 1, polys
+c = ov.canvas.coords(polys[0])
+assert c[0] == 0 and c[1] == 0, c[:2]                  # top-left at the corner
+assert c[2] == 380 and c[3] == 0, c[2:4]               # flat top, full width
+assert ov.canvas.itemcget(polys[0], "smooth") in ("0", "false", ""), \
+    ov.canvas.itemcget(polys[0], "smooth")             # no spline bow
+# bottom vertices must be pulled in by the radius, i.e. actually rounded
+assert min(c[0::2]) >= 0 and max(c[0::2]) <= 380
+assert c[-2] == 0, c[-4:]                              # last point back at x1
+
+# --- waveform bars -------------------------------------------------------------
+# own canvas inside the text frame, one rounded line per bar
+assert ov.viz is not None, "viz canvas missing"
+bars = ov.viz.find_all()
+assert len(bars) == 4, len(bars)
+for i in bars:
+    assert ov.viz.itemcget(i, "capstyle") == "round", ov.viz.itemcget(i, "capstyle")
+    assert ov.viz.itemcget(i, "fill") == "#0095f5", ov.viz.itemcget(i, "fill")
+xs = [ov.viz.coords(i)[0] for i in bars]
+assert xs == sorted(xs, reverse=True), xs            # laid out right to left
+# the lyric rows must stop before the bars start (viz x is local to its canvas)
+root.update()                       # place geometry is applied on idle
+viz_left = ov.viz.winfo_x()
+assert viz_left > 0, viz_left
+assert ov._x0 + ov._w <= viz_left + min(xs) - 6, (ov._x0, ov._w, viz_left, min(xs))
+
+# bars move: sample the drawn height twice, it must differ
+h0 = ov.viz.coords(bars[0])[3] - ov.viz.coords(bars[0])[1]
+time.sleep(0.12)
+ov._viz_tick()
+h1 = ov.viz.coords(bars[0])[3] - ov.viz.coords(bars[0])[1]
+assert h0 != h1, (h0, h1)
+assert max(ov.viz.coords(i)[3] - ov.viz.coords(i)[1] for i in bars) > 8
+
+# turning the bars off frees the gutter and removes the canvas
+app.viz_var.set(False)
+app.apply()
+root.update()
+assert ov.viz is None, "viz canvas was not destroyed"
+assert ov._viz_gutter == 0
+app.viz_var.set(True)
+app.apply()
+root.update()
+
+# align=bottom puts the playhead on the last visible row
+app.preset(dict(nl.PRESET_CARD, lines=3))
+ov.texts = ["a", "b", "c", "d"]
+ov.idx = None
+ov.render(2.0)
+root.update()
+# playhead at the bottom means the active row is the last one drawn
+by_text = {lbl.cget("text"): lbl for lbl in ov.lines}
+assert set(by_text) >= {"a", "b", "c"}, by_text.keys()
+assert by_text["c"].winfo_y() == 2 * ov.row_h(), by_text["c"].winfo_y()
+assert by_text["a"].winfo_y() == 0, by_text["a"].winfo_y()
 
 app.stop.set()
 root.destroy()
