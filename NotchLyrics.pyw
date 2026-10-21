@@ -829,7 +829,7 @@ class Overlay:
         self._viz_ids = []
         self._viz_gutter = 0             # px of the row the bars reserve
         if cfg["viz"]:
-            bw, gap, pad = 4, 4, 12
+            bw, gap, pad = 3, 3, 10
             gw = pad * 2 + cfg["viz_bars"] * bw + (cfg["viz_bars"] - 1) * gap
             gw = min(gw, max(20, w // 3))
             self._viz_n = max(1, (gw - pad * 2 + gap) // (bw + gap))
@@ -1042,7 +1042,7 @@ class Overlay:
         for k, i in enumerate(self._viz_ids):
             ph = t + k * 0.9
             amp = 0.30 + 0.62 * abs(math.sin(ph) * math.cos(ph * 0.61 + k))
-            half = max(2.0, amp * (h - 14) / 2)
+            half = max(2.0, amp * (h - 20) / 2)
             x = self.viz.coords(i)[0]
             cy = h / 2
             self.viz.coords(i, x, cy - half, x, cy + half)
