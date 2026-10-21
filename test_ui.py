@@ -555,8 +555,13 @@ root.update()
 # the app's own tick loop, which would overwrite ov.texts mid-assert with
 # whatever the previous block left in state and make these checks pass by luck.
 def draw(lines, idx):
+    # entrance animation would displace the rows mid-assert; this block tests
+    # row POSITION, so the slide has to be off (test_enter.py covers the slide)
+    app.cfg["enter_anim"] = False
     app.state["lines"], app.state["idx"] = lines, idx
     app.tick_once()
+    ov._enter = 1.0
+    ov.render()
     root.update()
     return {lbl.cget("text"): lbl for lbl in ov.lines if lbl.winfo_ismapped()}
 

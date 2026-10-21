@@ -116,6 +116,7 @@ DEFAULTS = {
     "viz": False,          # waveform bars at the right edge
     "viz_color": "#0095f5",
     "viz_bars": 4,
+    "enter_anim": True,    # slide + fade the lyrics in on a new track
 }
 
 # The Source dropdown lists whatever SMTC currently publishes, so it is built at
@@ -601,6 +602,7 @@ def sanitize(raw):
     d["card"] = bool(d["card"])
     d["art"] = bool(d["art"])
     d["viz"] = bool(d["viz"])
+    d["enter_anim"] = bool(d["enter_anim"])
     d["notch"] = bool(d["notch"])
     d["align"] = d["align"] if d["align"] in ("top", "center", "bottom") else DEFAULTS["align"]
     d["anchor"] = (d["anchor"] if d["anchor"] in ANCHORS
@@ -634,6 +636,8 @@ def save_cfg(cfg):
 
 ANIM_MS = 260          # transition length, close to Spotify's lyric glide
 ANIM_FRAME_MS = 16     # ~60fps; coarse steps look like a jump, not a glide
+ENTER_MS = 240         # new-track entrance: slide up + fade in
+ENTER_SLIDE = 0.55     # how far the block travels, as a fraction of one row
 
 
 def lerp_color(c1, c2, t):
@@ -717,6 +721,8 @@ class Overlay:
         self.pos = 0.0          # float playhead: animates towards idx
         self._row = 0           # cached row pitch, set in apply()
         self._anim_job = None
+        self._enter_job = None
+        self._enter = 1.0        # 1 = settled; <1 while the new-track intro runs
         self._from = self._to = 0.0
         self._t0 = 0.0
         self._art_png = b""
@@ -984,6 +990,13 @@ class Overlay:
         font = (cfg["font_family"], cfg["font_size"],
                 "bold" if cfg["bold"] else "normal")
         x0, w = getattr(self, "_x0", 0), getattr(self, "_w", cfg["width"])
+        # New-track entrance: the block slides up into place and fades in from
+        # the background colour. `_enter` is 1 when settled, so the steady state
+        # costs nothing. Tk's colour key is 1-bit, so "fade" means blending the
+        # text towards the card colour, not real alpha.
+        ent = getattr(self, "_enter", 1.0)
+        slide = round((1.0 - ent) * h * ENTER_SLIDE)
+        blend = cfg["bg"] if cfg["card"] else self.box.cget("bg")
         for lbl in self.lines:
             lbl.place_forget()
         for k, lbl in enumerate(self.lines):
@@ -991,9 +1004,11 @@ class Overlay:
             if i >= len(self.texts):
                 break
             act = max(0.0, 1.0 - min(1.0, abs(i - pos)))   # 1 = playhead, 0 = 2+ away
-            lbl.configure(text=self.texts[i], font=font,
-                          fg=lerp_color(dim, fg, act))
-            lbl.place(x=x0, y=round((i - top) * h), width=w, height=h)
+            fcolor = lerp_color(dim, fg, act)
+            if ent < 1:
+                fcolor = lerp_color(blend, fcolor, ent)
+            lbl.configure(text=self.texts[i], font=font, fg=fcolor)
+            lbl.place(x=x0, y=round((i - top) * h) + slide, width=w, height=h)
 
     def animate_to(self, idx):
         """Glide the playhead from where it is to `idx` instead of snapping."""
@@ -1058,9 +1073,12 @@ class Overlay:
 
     def set_content(self, texts, idx):
         if texts != self.texts:
+            new_song = bool(self.texts) and bool(texts)
             self.texts = texts
             self.idx = None                # new song: snap, don't glide
             self.pos = float(idx or 0)
+            if new_song and self.cfg.get("enter_anim", True):
+                self._enter_from()         # slide+fade the block in
             self.render()
             self.idx = idx
             return
@@ -1068,6 +1086,36 @@ class Overlay:
             return
         self.idx = idx
         self.animate_to(idx)
+
+    def _enter_from(self):
+        """Start the new-track transition: the block rises into place and fades.
+
+        Two tracks back to back have nothing in common to glide between, so the
+        line glide looks like a hard cut. A short block slide covers the swap.
+        ponytail: vertical slide + colour blend only, since the colour key is
+        1-bit and Tk has no per-widget alpha.
+        """
+        if self._enter_job:
+            try:
+                self.win.after_cancel(self._enter_job)
+            except tk.TclError:
+                pass
+            self._enter_job = None
+        self._enter = 0.0
+        t0 = time.monotonic()
+
+        def step():
+            t = min(1.0, (time.monotonic() - t0) * 1000 / ENTER_MS)
+            self._enter = 1 - (1 - t) ** 3            # ease-out
+            self.render()
+            if t < 1:
+                self._enter_job = self.win.after(ANIM_FRAME_MS, step)
+            else:
+                self._enter_job = None
+                self._enter = 1.0
+                self.render()
+
+        step()
 
     def _clickthrough(self):
         hwnd = ctypes.windll.user32.GetParent(self.win.winfo_id())
@@ -1219,6 +1267,11 @@ class App:
         entry("Waveform bars", "viz_bars")
         color("Waveform colour", "viz_color")
 
+        self.enter_var = tk.BooleanVar(value=c["enter_anim"])
+        ttk.Checkbutton(f, text="Slide lyrics in on a new track", variable=self.enter_var,
+                        command=self.apply).grid(row=r, column=0, columnspan=3, sticky="w", pady=3)
+        r += 1
+
         ttk.Label(f, text="Position").grid(row=r, column=0, sticky="w", pady=3)
         self.vars["anchor"] = tk.StringVar(value=c["anchor"])
         ttk.Combobox(f, textvariable=self.vars["anchor"], values=ANCHORS,
@@ -1277,6 +1330,7 @@ class App:
         c["art"] = self.art_var.get()
         c["card"] = self.card_var.get()
         c["viz"] = self.viz_var.get()
+        c["enter_anim"] = self.enter_var.get()
         c["align"] = self.vars["align"].get()
         c["anchor"] = self.vars["anchor"].get()
         try:
@@ -1309,6 +1363,7 @@ class App:
             self.art_var.set(c["art"])
             self.card_var.set(c["card"])
             self.viz_var.set(c["viz"])
+            self.enter_var.set(c["enter_anim"])
             self.vars["align"].set(c["align"])
             self.bold.set(c["bold"])
             self.alpha.set(c["alpha"])

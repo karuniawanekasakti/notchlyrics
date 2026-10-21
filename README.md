@@ -51,6 +51,8 @@ Everything is in the launcher window, and changes apply live:
 | Card radius | corner radius of that panel |
 | Card border colour | 1px outline around the card |
 | Show album art | draws the track's cover art from the Windows media session to the left of the lyrics |
+| Waveform bars | synthetic equalizer on the right, animated from a sine — not real audio (WASAPI loopback returns silence on this machine). Width, colour and bar count are all fields |
+| Slide lyrics in on a new track | the lyric block rises about half a row and fades in from the card colour when the track changes. Off makes it snap. `ENTER_MS` / `ENTER_SLIDE` at the top of the file tune it |
 | Transparent background | Windows colour-key transparency — only the card and the text are visible |
 | Opacity | slider from 0.2 to 1.0 for the whole window |
 | Click-through | when disabled, the overlay becomes clickable |
@@ -98,6 +100,7 @@ Verify the live SMTC session and real lyrics (a track must be playing):
 | `round_rect()` | rounded rectangle as a smoothed polygon — Tk has no primitive for it |
 | `Overlay.render(pos)` | `pos` is a fractional line index; rows move per pixel, emphasis comes from `lerp_color(dim, fg, act)` only |
 | `Overlay.animate_to()` | `after(16ms)` for ~260 ms, ease-out cubic — the playhead glides instead of jumping |
+| `Overlay._enter_from()` | new-track entrance: drives `_enter` 0 → 1 over `ENTER_MS`, and `render()` reads it to offset the block and blend the text from the card colour |
 | `Overlay.apply()` | geometry from `screen_work()` + `anchor_xy()` (work area minus taskbar, so bottom anchors clear the taskbar), alpha, card and font; `-transparentcolor` for the transparent background |
 | `App` | the launcher window; every field change calls `apply()` and updates the overlay |
 
