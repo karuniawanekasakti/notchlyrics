@@ -361,6 +361,59 @@ th2.join(timeout=2)
 nl._probe, nl.fetch_lyrics = real_probe, real_fetch
 print("song change: ok")
 
+# --- the player's placeholder art is replaced when the real cover arrives ----
+# Brave flips the session to the next song and puts its own 256x256 app icon in
+# the thumbnail slot; the real cover shows up seconds later. Reading the stream
+# once latched that icon for the whole track — the "no cover, Brave icon
+# instead" report, which only happened on an automatic advance because pressing
+# Next lands nearer to when the real art is ready.
+cover = {"track": "A", "reads": []}
+ICON = b"BRAVE-ICON-256"          # same bytes for every track: a placeholder
+REAL_B = b"COVER-B-150"
+
+def probe_art(source="Auto"):
+    return {"title": cover["track"], "artist": "x", "pos": 5.0, "len": 200.0,
+            "playing": True, "thumb": cover["track"]}
+
+def flaky_art(ref):
+    cover["reads"].append(ref)
+    if ref == "A":
+        return b"COVER-A"
+    # track B: empty, then the app icon, then the real cover. This is the order
+    # measured on live Brave SMTC.
+    n = cover["reads"].count("B")
+    if n == 1:
+        return b""
+    if n <= 3:
+        return ICON
+    return REAL_B
+
+real_art, real_art_retry = nl.art_png, nl.ART_RETRY_S
+nl._probe, nl.art_png = probe_art, flaky_art
+nl.fetch_lyrics = lambda *a, **k: [(0.0, "line")]
+nl.ART_RETRY_S = 0.0              # retry on every tick instead of every second
+st3 = {"lines": [], "idx": None, "art": b""}
+stop3 = threading.Event()
+th3 = threading.Thread(target=real_poll, args=(st3, stop3), daemon=True)
+th3.start()
+
+time.sleep(0.6)
+assert st3["art"] == b"COVER-A", st3["art"]
+cover["track"] = "B"
+time.sleep(0.7)
+# the old cover is dropped at once, and the placeholder is allowed through so
+# the overlay is never blank while it waits
+assert st3["art"] in (b"", ICON), st3["art"]
+time.sleep(1.6)
+assert st3["art"] == REAL_B, ("real cover never replaced the icon", st3["art"])
+assert st3["art"] != ICON, "still showing the browser icon at the end"
+
+stop3.set()
+th3.join(timeout=2)
+nl._probe, nl.fetch_lyrics, nl.art_png = real_probe, real_fetch, real_art
+nl.ART_RETRY_S = real_art_retry
+print("cover retry:", len(cover["reads"]), "reads, ended on the real cover")
+
 # --- toggle ---
 app.toggle()
 root.update()

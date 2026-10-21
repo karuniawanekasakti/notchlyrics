@@ -28,6 +28,8 @@ from tkinter import colorchooser, font as tkfont, ttk
 CONFIG = Path(__file__).with_name("config.json")
 MAGIC = "#010203"       # key colour Windows drops when -transparentcolor is on
 RETRY_S = 30            # re-ask lrclib after a failed fetch, don't cache the miss
+ART_RETRY_S = 1.0       # how often the cover stream is re-read after a track change
+ART_TRIES = 10          # ... up to this many reads, then keep whatever came
 TAB = "tab: "           # Source value prefix for a single browser tab
 _TABS = (0.0, [])       # (monotonic stamp, tab list) cache for browser_tabs()
 
@@ -389,20 +391,31 @@ def sessions():
 
 
 def art_png(ref):
-    """Album art as PNG bytes. Read only when the track changes: the stream is
-    real I/O, so doing it on every poll tick would be wasteful."""
+    """Album art as PNG bytes. One read per track in the normal case: the
+    stream is real I/O, so re-reading it on every poll tick would be wasteful.
+
+    Read in chunks, and take the length from the buffer WinRT hands back: the
+    same reference can open onto an empty stream while the player is still
+    publishing the track (measured: readable ~1 s after the title changes on an
+    automatic advance), and a stream may hand back fewer bytes than asked for.
+    One read sized by `st.size` returned b"" and that got cached as "no cover".
+    """
     if ref is None:
         return b""
     from winsdk.windows.storage.streams import Buffer, DataReader, InputStreamOptions
 
     async def go():
         st = await ref.open_read_async()
-        buf = Buffer(st.size)
-        await st.read_async(buf, st.size, InputStreamOptions.NONE)
-        r = DataReader.from_buffer(buf)
-        out = bytearray(r.unconsumed_buffer_length)
-        r.read_bytes(out)
-        return bytes(out)
+        out = bytearray()
+        while True:
+            buf = Buffer(1 << 16)
+            got = await st.read_async(buf, 1 << 16, InputStreamOptions.NONE)
+            if not got.length:
+                return bytes(out)
+            r = DataReader.from_buffer(got)
+            chunk = bytearray(got.length)
+            r.read_bytes(chunk)
+            out += chunk
 
     try:
         return asyncio.run(go())
@@ -529,6 +542,7 @@ def poll(state, stop, cfg=None):
     """Background thread: keeps state["lines"]/state["idx"] fresh."""
     last_key, lines = "", []
     fetched_at = 0.0
+    art_key, art_tries, art_at = "", 0, 0.0
     while not stop.is_set():
         try:
             np = _probe((cfg or {}).get("source", "Auto"))
@@ -548,8 +562,30 @@ def poll(state, stop, cfg=None):
                 last_key = key
                 fetched_at = time.monotonic()
                 lines = fetch_lyrics(np["title"], np["artist"], np["len"])
-                # cover is per track, so read it here and not on every tick
-                state["art"] = art_png(np.get("thumb"))
+            # A player publishes the new title before its real artwork. Brave
+            # puts its own 256x256 app icon in the thumbnail slot first (same
+            # bytes for every track), and the actual cover only turns up a few
+            # seconds later — measured at 0.3s for an icon, then 5-15s for a
+            # 150x150 cover on an automatic advance. A single read therefore
+            # latches the browser icon for the whole track, which is the
+            # "cover is missing, Brave icon instead" report. Pressing Next looks
+            # fine only because that path lands closer to when the real art is
+            # ready.
+            #
+            # So: drop the previous cover on a track change and keep re-reading
+            # for a short window, replacing what we have whenever the bytes
+            # change. Reading is cheap (a stream open per second, ten per track)
+            # and the last read wins, so no preference for "icon vs cover" has
+            # to be guessed.
+            if key != art_key:
+                art_key, art_tries, art_at = key, 0, 0.0
+                state["art"] = b""       # never keep the previous track's cover
+            if art_tries < ART_TRIES and time.monotonic() >= art_at:
+                art_tries += 1
+                art_at = time.monotonic() + ART_RETRY_S
+                png = art_png(np.get("thumb"))
+                if png and png != state["art"]:
+                    state["art"] = png
             i = None
             for idx, (t, _) in enumerate(lines):
                 if t <= np["pos"]:
@@ -565,7 +601,7 @@ def poll(state, stop, cfg=None):
                 # falling back to the title for the whole intro.
                 state["lines"], state["idx"] = [t for _, t in lines], i or 0
         else:
-            last_key, lines = "", []
+            last_key, lines, art_key = "", [], ""
             state["lines"], state["idx"] = [], None
             state["art"] = b""
         stop.wait(0.3)

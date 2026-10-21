@@ -91,12 +91,12 @@ Verify the live SMTC session and real lyrics (a track must be playing):
 | `_probe()` | `sessions()` filtered by `is_song()` and handed to `pick_session()`; for a `tab: ` source it keeps the browser's session (position, length, cover) and uses the tab label to confirm the tab is still playing |
 | `fetch_lyrics()` | `lrclib.net/api/search` → `syncedLyrics` (free, no API key); picks the version whose duration matches the playing track |
 | `parse_lrc()` | `[mm:ss.xx]text` → `[(seconds, text)]` |
-| `poll()` | background thread: track + position → `state["lines"]` and `state["idx"]` |
+| `poll()` | background thread: track + position → `state["lines"]` and `state["idx"]`. Re-reads the cover for a short window after a track change, because players publish the new title before the real artwork (Brave substitutes its own app icon first) |
 | `screen_work()` | primary monitor's work area via `SystemParametersInfoW(SPI_GETWORKAREA)` — the screen minus the taskbar, on any side. Returns `None` if Windows reports nothing, and the caller falls back to the raw screen |
 | `anchor_xy()` | anchor + work area → top-left pixel. The single place that knows top edge is `work.top` and bottom edge is `work.bottom - h` |
 | `notch_corners()` | which corners stay rounded for a Position anchor: every corner not on a flush screen edge |
 | `notch_shape()` | screen-edge polygon, computed point by point; `rounded` names the corners that keep the radius |
-| `Overlay.set_art()` | decodes the PNG bytes from `art_png()` and (re)places the cover label; subsamples by powers of two to the requested size |
+| `Overlay.set_art()` | decodes the PNG bytes from `art_png()` and (re)places the cover label; subsamples by powers of two to the requested size. The cache key is the bytes themselves, so a cover that arrives late replaces the placeholder |
 | `round_rect()` | rounded rectangle as a smoothed polygon — Tk has no primitive for it |
 | `Overlay.render(pos)` | `pos` is a fractional line index; rows move per pixel, emphasis comes from `lerp_color(dim, fg, act)` only |
 | `Overlay.animate_to()` | `after(16ms)` for ~260 ms, ease-out cubic — the playhead glides instead of jumping |
