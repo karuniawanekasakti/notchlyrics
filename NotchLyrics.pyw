@@ -673,17 +673,17 @@ def save_cfg(cfg):
 
 ANIM_MS = 260          # transition length, close to Spotify's lyric glide
 ANIM_FRAME_MS = 16     # ~60fps; coarse steps look like a jump, not a glide
-ENTER_MS = 240         # new-track entrance: slide up + fade in
-ENTER_SLIDE = 0.55     # how far the block travels, as a fraction of one row
+ENTER_MS = 320         # new-track swap: outgoing leaves left, incoming arrives right
+ENTER_OUT = 0.42       # share of the swap spent leaving; the rest is arriving
 
 # One easing per track, chosen from the track's own text, so consecutive songs
 # do not all arrive with the identical motion. Deterministic: the same track
 # always gets the same curve, which matters because a re-fetch of the same song
 # must not change the feel mid-play.
 EASINGS = {
-    "out-cubic": lambda t: 1 - (1 - t) ** 3,
-    "out-quint": lambda t: 1 - (1 - t) ** 5,
+    "in-out-sine": lambda t: 0.5 - 0.5 * math.cos(math.pi * t),
     "in-out-cubic": lambda t: 4 * t ** 3 if t < 0.5 else 1 - (-2 * t + 2) ** 3 / 2,
+    "in-out-quint": lambda t: 16 * t ** 5 if t < 0.5 else 1 - (-2 * t + 2) ** 5 / 2,
     "out-back": lambda t: 1 + 2.70158 * (t - 1) ** 3 + 1.70158 * (t - 1) ** 2,
 }
 
@@ -781,7 +781,9 @@ class Overlay:
         self._row = 0           # cached row pitch, set in apply()
         self._anim_job = None
         self._enter_job = None
-        self._enter = 1.0        # 1 = settled; <1 while the new-track intro runs
+        self._enter = 1.0        # 1 = settled; <1 while the new-track swap runs
+        self._enter_prev = None  # outgoing lyrics, shown during the first half
+        self._enter_ease = EASINGS["in-out-cubic"]   # replaced per track
         self._from = self._to = 0.0
         self._t0 = 0.0
         self._art_png = b""
@@ -1038,36 +1040,61 @@ class Overlay:
 
         h = self.row_h()
         vis = max(1, cfg["lines"])
-        pos = max(0.0, min(float(self.pos), len(self.texts) - 1))
-        self.pos = pos                     # keep it clamped for the next glide
+        x0, w = getattr(self, "_x0", 0), getattr(self, "_w", cfg["width"])
+        blend = cfg["bg"] if cfg["card"] else self.box.cget("bg")
+
+        # New-track transition, left to right: the outgoing lyrics travel left
+        # and fade to the card colour, then the incoming ones arrive from the
+        # right. One label set serves both halves — the text is swapped at the
+        # midpoint, where the outgoing lines are already fully transparent, so
+        # nothing visible ever changes text in place.
+        ent = getattr(self, "_enter", 1.0)
+        texts, dx, fade = self.texts, 0, 1.0
+        if ent < 1:
+            prev = getattr(self, "_enter_prev", None)
+            # p is linear inside each half and the per-track curve is applied to
+            # p, not to the clock. Easing the clock was the bug: out-quint reached
+            # 0.8 of the whole transition in 30% of the time, so the incoming half
+            # got about three frames and read as a cut. Each half now gets its
+            # full share of ENTER_MS, curved.
+            if prev and ent < ENTER_OUT:
+                texts = prev
+                # Departure is the ARRIVAL curve mirrored: q = 1 - ease(1 - q).
+                # Using the raw curve here was the stiffness — out-back is
+                # fastest at t=0, so the outgoing lyrics left the screen in two
+                # frames and the swap read as a cut. Mirrored, every curve starts
+                # slow, and the motion is continuous through the midpoint
+                # because the two halves are the same curve back to back.
+                q = ent / ENTER_OUT
+                p = 1.0 - self._enter_ease(1.0 - q)
+                dx, fade = round(-p * w), 1.0 - min(1.0, p)
+            else:
+                p = self._enter_ease((ent - ENTER_OUT) / (1.0 - ENTER_OUT))
+                dx, fade = round((1.0 - p) * w), min(1.0, p)
+
+        pos = max(0.0, min(float(self.pos), len(texts) - 1))
+        if texts is self.texts:
+            self.pos = pos                     # keep it clamped for the next glide
         # scroll so the playhead sits where the preset wants it, clamped at both
         # ends: top = first visible row, center = middle, bottom = last.
-        rows = max(0, len(self.texts) - vis)
+        rows = max(0, len(texts) - vis)
         off = {"top": 0.0, "center": 0.5, "bottom": 1.0}[cfg["align"]] * (vis - 1)
         top = max(0.0, min(pos - off, rows))
         fg, dim = cfg["fg"], cfg["dim"]
         font = (cfg["font_family"], cfg["font_size"],
                 "bold" if cfg["bold"] else "normal")
-        x0, w = getattr(self, "_x0", 0), getattr(self, "_w", cfg["width"])
-        # New-track entrance: the block slides up into place and fades in from
-        # the background colour. `_enter` is 1 when settled, so the steady state
-        # costs nothing. Tk's colour key is 1-bit, so "fade" means blending the
-        # text towards the card colour, not real alpha.
-        ent = getattr(self, "_enter", 1.0)
-        slide = round((1.0 - ent) * h * ENTER_SLIDE)
-        blend = cfg["bg"] if cfg["card"] else self.box.cget("bg")
         for lbl in self.lines:
             lbl.place_forget()
         for k, lbl in enumerate(self.lines):
             i = int(top) + k
-            if i >= len(self.texts):
+            if i >= len(texts):
                 break
             act = max(0.0, 1.0 - min(1.0, abs(i - pos)))   # 1 = playhead, 0 = 2+ away
             fcolor = lerp_color(dim, fg, act)
-            if ent < 1:
-                fcolor = lerp_color(blend, fcolor, ent)
-            lbl.configure(text=self.texts[i], font=font, fg=fcolor)
-            lbl.place(x=x0, y=round((i - top) * h) + slide, width=w, height=h)
+            if fade < 1:
+                fcolor = lerp_color(blend, fcolor, fade)
+            lbl.configure(text=texts[i], font=font, fg=fcolor)
+            lbl.place(x=x0 + dx, y=round((i - top) * h), width=w, height=h)
 
     def animate_to(self, idx):
         """Glide the playhead from where it is to `idx` instead of snapping."""
@@ -1133,11 +1160,12 @@ class Overlay:
     def set_content(self, texts, idx):
         if texts != self.texts:
             new_song = bool(self.texts) and bool(texts)
+            self._enter_prev = self.texts if new_song else None
             self.texts = texts
             self.idx = None                # new song: snap, don't glide
             self.pos = float(idx or 0)
             if new_song and self.cfg.get("enter_anim", True):
-                self._enter_from()         # slide+fade the block in
+                self._enter_from()         # left→right swap
             self.render()
             self.idx = idx
             return
@@ -1147,12 +1175,16 @@ class Overlay:
         self.animate_to(idx)
 
     def _enter_from(self):
-        """Start the new-track transition: the block rises into place and fades.
+        """Start the left→right track swap.
 
-        Two tracks back to back have nothing in common to glide between, so the
-        line glide looks like a hard cut. A short block slide covers the swap.
-        ponytail: vertical slide + colour blend only, since the colour key is
-        1-bit and Tk has no per-widget alpha.
+        Two tracks back to back share nothing to glide between, so a per-line
+        glide reads as a hard cut. Here the outgoing lyrics slide left and fade
+        out, then the incoming ones slide in from the right — a single `_enter`
+        value covers both halves.
+
+        ponytail: horizontal slide + colour blend only. Tk's colour key is 1-bit
+        and labels have no alpha, so the "fade" is the text colour blended
+        towards the card.
         """
         if self._enter_job:
             try:
@@ -1166,7 +1198,9 @@ class Overlay:
 
         def step():
             t = min(1.0, (time.monotonic() - t0) * 1000 / ENTER_MS)
-            self._enter = min(1.0, max(0.0, self._enter_ease(t)))
+            # Linear clock. render() applies _enter_ease inside each half, so the
+            # curve shapes the motion instead of eating the incoming frames.
+            self._enter = t
             self.render()
             if t < 1:
                 self._enter_job = self.win.after(ANIM_FRAME_MS, step)

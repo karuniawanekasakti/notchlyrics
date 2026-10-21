@@ -1,11 +1,11 @@
-"""Does a new track actually animate, and does the toggle turn it off?
+"""Does the track swap actually move left→right, and can it be turned off?
 
-Measures the entrance frames on the real Overlay: mid-transition the rows must
-be displaced (slide) and darker than settled (fade).
+Samples the live Overlay during a real track change: the outgoing lyrics must
+travel left, the incoming ones must arrive from the right, the text may only
+change while nothing is visible, and the block must settle flush at dx=0.
 """
 import importlib.machinery as m
 import importlib.util as u
-import tempfile
 import time
 import tkinter as tk
 from pathlib import Path
@@ -17,59 +17,78 @@ l.exec_module(nl)
 
 root = tk.Tk()
 root.withdraw()
-cfg = nl.sanitize(dict(nl.PRESET_CARD, lines=2, align="top"))
-ov = nl.Overlay(root, cfg)
+ov = nl.Overlay(root, nl.sanitize(dict(nl.PRESET_CARD, lines=2, align="top")))
 root.update()
+W, X0 = ov._w, ov._x0
 
 
-def settle():
-    root.update()
-
-
-def frame_state():
-    rows = []
-    for lbl in ov.lines:
-        if lbl.winfo_ismapped():
-            rows.append((lbl.cget("text"), lbl.winfo_y(), lbl.cget("fg")))
+def snap():
+    rows = [(lbl.cget("text"), lbl.winfo_x() - X0, lbl.cget("fg"))
+            for lbl in ov.lines if lbl.winfo_ismapped()]
     return sorted(rows, key=lambda r: r[1])
 
 
-# first track: no entrance (nothing to transition from)
-ov.set_content(["one a", "one b", "one c"], 0)
-settle()
-print("first track settled:", frame_state())
+A = ["old line one", "old line two", "old line three"]
+B = ["new line one", "new line two", "new line three"]
 
-# second track: entrance must run
-ov.set_content(["two a", "two b", "two c"], 0)
+ov.set_content(A, 0)
+root.update()
+ov._enter = 1.0
+ov.render()
+root.update()
+print("settled A:", snap())
+
+ov.set_content(B, 0)
 t0 = time.monotonic()
-samples = []
-while time.monotonic() - t0 < nl.ENTER_MS / 1000:
-    settle()
-    samples.append((time.monotonic() - t0, ov._enter, frame_state()[0]))
+frames = []
+while time.monotonic() - t0 < (nl.ENTER_MS / 1000 + 0.05):
+    root.update()
+    frames.append((round((time.monotonic() - t0) * 1000), ov._enter, snap()))
     time.sleep(0.012)
-print("frames during entrance: %d" % len(samples))
-for t, e, top in samples[:6]:
-    print("   t=%5.0fms enter=%.2f top=(%r, y=%d, %s)" % (t * 1000, e, *top))
+root.update()
 
-settle()
-print("after entrance:", frame_state())
-assert len(samples) > 3, samples
-mid = [s for s in samples if 0.1 < s[1] < 0.9]
-assert mid, "entrance never hit a mid frame: it is not animating"
-# mid-transition rows sit lower than settled (slide from below) and their text
-# is darker than the final colour (fade from the card background)
-mid_state = mid[0][2]
-final_state = frame_state()[0]
-assert mid_state[1] > final_state[1], (mid_state, final_state)
-assert mid_state[2] != final_state[2], (mid_state, final_state)
+print("frames:", len(frames), " content width:", W)
+for t, e, rows in frames[::3]:
+    texts = [r[0] for r in rows if r[0]]
+    dxs = [r[1] for r in rows if r[0]]
+    print("  t=%3dms enter=%.2f dx=%-16s %s" % (
+        t, e, str(sorted(set(dxs))[:3]), texts[:1]))
 
-# turning it off: a new track must snap straight to the settled frame
+# outgoing half: old text, negative x (moving left)
+out = [(t, e, r) for t, e, rows in frames for r in rows
+       if r[0].startswith("old") and e < 0.5]
+assert out, "no outgoing frames: the old lyrics never showed"
+assert min(r[1] for _, _, r in out) < 0, ("old lyrics did not move left",
+                                          min(r[1] for _, _, r in out))
+# incoming half: new text, positive x (arriving from the right)
+inc = [(t, e, r) for t, e, rows in frames for r in rows
+       if r[0].startswith("new") and e > 0.5]
+assert inc, "no incoming frames: the new lyrics never showed"
+assert max(r[1] for _, _, r in inc) > 0, ("new lyrics did not arrive from the right",
+                                          max(r[1] for _, _, r in inc))
+# text may only swap at the midpoint, where the outgoing lines are invisible
+early = [r[0] for t, e, rows in frames if e < 0.4 for r in rows if r[0]]
+assert not any(t.startswith("new") for t in early), ("new text appeared early", early)
+
+# and it settles flush at 0 on the new track
+last = snap()
+assert all(r[1] == 0 for r in last if r[0]), last
+assert last[0][0] == "new line one", last
+
+print("\nPASS: outgoing left (min dx=%d), incoming from right (max dx=%d), settled at 0"
+      % (min(r[1] for _, _, r in out), max(r[1] for _, _, r in inc)))
+
+# with the animation off it must snap, not slide
 ov.cfg["enter_anim"] = False
-ov.set_content(["three a", "three b", "three c"], 0)
-settle()
-assert ov._enter == 1.0, ov._enter
-assert frame_state()[0][1] == 0, frame_state()
-print("enter_anim off -> snapped, no slide")
+ov.set_content(A, 0)
+root.update()
+ov._enter = 1.0
+ov.render()
+ov.set_content(B, 0)
+root.update()
+assert ov._enter == 1.0 and ov.texts is B, (ov._enter, ov.texts)
+assert all(r[1] == 0 for r in snap() if r[0]), snap()
+print("enter_anim off -> snapped at dx=0")
 
 # easing per track: deterministic for the same track, spread across tracks
 names = sorted(nl.EASINGS)
@@ -95,4 +114,4 @@ assert nl.sanitize({})["enter_anim"] is True          # on by default
 assert nl.PRESET_CARD.get("enter_anim", True) is True
 
 root.destroy()
-print("\nPASS: new-track entrance animates, and the toggle controls it")
+print("\nPASS: left-to-right swap animates, and the toggle controls it")
