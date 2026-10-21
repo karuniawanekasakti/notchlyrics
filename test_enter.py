@@ -6,6 +6,7 @@ change while nothing is visible, and the block must settle flush at dx=0.
 """
 import importlib.machinery as m
 import importlib.util as u
+import sys
 import time
 import tkinter as tk
 from pathlib import Path
@@ -14,6 +15,9 @@ HERE = Path(__file__).resolve().parent
 l = m.SourceFileLoader("nl", str(HERE / "NotchLyrics.pyw"))
 nl = u.module_from_spec(u.spec_from_loader("nl", l))
 l.exec_module(nl)
+
+if sys.platform != "win32":
+    nl.Overlay._clickthrough = lambda self: None    # ctypes.windll only exists on Windows
 
 root = tk.Tk()
 root.withdraw()

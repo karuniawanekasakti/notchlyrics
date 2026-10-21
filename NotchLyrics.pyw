@@ -542,6 +542,7 @@ def poll(state, stop, cfg=None):
     """Background thread: keeps state["lines"]/state["idx"] fresh."""
     last_key, lines = "", []
     fetched_at = 0.0
+    fetched_key = ""         # which track's lyric fetch has come back
     art_key, art_tries, art_at = "", 0, 0.0
     while not stop.is_set():
         try:
@@ -553,15 +554,17 @@ def poll(state, stop, cfg=None):
             # A 503/timeout must not be cached as "this song has no lyrics" —
             # retry every RETRY_S while we're still showing the title fallback.
             stale = not lines and time.monotonic() - fetched_at > RETRY_S
-            if key != last_key:
-                # New track: drop the old song's lines right now. Otherwise the
-                # previous track's lyrics get shown against this one's position
-                # until the fetch returns (or forever, if it returns nothing).
-                lines = []
+            # Do NOT clear `lines` on a track change. The previous fetch is what
+            # the overlay needs as its OUTGOING text: set_content() animates
+            # old -> new, and an emptied list in between made every live track
+            # change start from nothing, so only half the swap played (and, on a
+            # manual Next, none of it). The fetch below replaces it a moment
+            # later, which is itself the change the animation runs on.
             if key != last_key or stale:
                 last_key = key
                 fetched_at = time.monotonic()
                 lines = fetch_lyrics(np["title"], np["artist"], np["len"])
+                fetched_key = key            # this track's fetch has returned
             # A player publishes the new title before its real artwork. Brave
             # puts its own 256x256 app icon in the thumbnail slot first (same
             # bytes for every track), and the actual cover only turns up a few
@@ -592,6 +595,12 @@ def poll(state, stop, cfg=None):
                     i = idx
             if not np["playing"]:
                 state["lines"], state["idx"] = [], None
+            elif not lines and fetched_key != key:
+                # This track's fetch has not returned yet. Hold the previous
+                # lyrics on screen instead of flashing a one-line title: that
+                # intermediate state consumed the swap animation, so the real
+                # lyrics then appeared with no transition at all.
+                pass
             elif not lines:
                 state["lines"] = [f"\u266a {np['title']} \u2014 {np['artist']}"]
                 state["idx"] = 0
@@ -602,6 +611,7 @@ def poll(state, stop, cfg=None):
                 state["lines"], state["idx"] = [t for _, t in lines], i or 0
         else:
             last_key, lines, art_key = "", [], ""
+            fetched_key = ""
             state["lines"], state["idx"] = [], None
             state["art"] = b""
         stop.wait(0.3)
@@ -694,7 +704,8 @@ def ease_for(texts):
     crc32 rather than hash(): CPython randomises string hashing per process, so
     hash() would give the same song a different curve on every launch.
     """
-    key = "\x00".join(texts or ()).encode("utf-8", "ignore")
+    key = "\x00".join(t[1] if isinstance(t, tuple) else t
+                      for t in (texts or ())).encode("utf-8", "ignore")
     names = sorted(EASINGS)
     return EASINGS[names[zlib.crc32(key) % len(names)]]
 
@@ -1083,11 +1094,15 @@ class Overlay:
         fg, dim = cfg["fg"], cfg["dim"]
         font = (cfg["font_family"], cfg["font_size"],
                 "bold" if cfg["bold"] else "normal")
-        for lbl in self.lines:
-            lbl.place_forget()
+        # No place_forget() sweep here: it cost 16ms per call (measured) against
+        # a 16ms frame budget, so the swap dropped most of its frames. place()
+        # with the same geometry is free and re-placing an already-placed label
+        # just moves it, so the loop below hides the leftover rows itself.
         for k, lbl in enumerate(self.lines):
             i = int(top) + k
             if i >= len(texts):
+                # trailing label beyond the last line: park it, don't paint
+                lbl.place_forget()
                 break
             act = max(0.0, 1.0 - min(1.0, abs(i - pos)))   # 1 = playhead, 0 = 2+ away
             fcolor = lerp_color(dim, fg, act)
@@ -1159,8 +1174,13 @@ class Overlay:
 
     def set_content(self, texts, idx):
         if texts != self.texts:
-            new_song = bool(self.texts) and bool(texts)
-            self._enter_prev = self.texts if new_song else None
+            # Any content arriving is a new track, even onto an empty screen.
+            # On a manual Next the player reports no session for a poll tick,
+            # so poll() clears the old lyrics and the new track lands as
+            # [] -> texts. Requiring both sides non-empty skipped the swap on
+            # exactly that path; with no outgoing text the arrival half runs.
+            new_song = bool(texts)
+            self._enter_prev = self.texts if new_song and self.texts else None
             self.texts = texts
             self.idx = None                # new song: snap, don't glide
             self.pos = float(idx or 0)
@@ -1180,7 +1200,10 @@ class Overlay:
         Two tracks back to back share nothing to glide between, so a per-line
         glide reads as a hard cut. Here the outgoing lyrics slide left and fade
         out, then the incoming ones slide in from the right — a single `_enter`
-        value covers both halves.
+        value covers both halves. When the old lyrics are already gone (the
+        live path cleared them before the new fetch landed) there is nothing
+        to slide out, so the clock starts at the midpoint and only the
+        arrival is played.
 
         ponytail: horizontal slide + colour blend only. Tk's colour key is 1-bit
         and labels have no alpha, so the "fade" is the text colour blended
@@ -1192,7 +1215,8 @@ class Overlay:
             except tk.TclError:
                 pass
             self._enter_job = None
-        self._enter = 0.0
+        start = 0.0 if self._enter_prev else ENTER_OUT
+        self._enter = start
         self._enter_ease = ease_for(self.texts)
         t0 = time.monotonic()
 
@@ -1200,7 +1224,7 @@ class Overlay:
             t = min(1.0, (time.monotonic() - t0) * 1000 / ENTER_MS)
             # Linear clock. render() applies _enter_ease inside each half, so the
             # curve shapes the motion instead of eating the incoming frames.
-            self._enter = t
+            self._enter = start + (1.0 - start) * t
             self.render()
             if t < 1:
                 self._enter_job = self.win.after(ANIM_FRAME_MS, step)
