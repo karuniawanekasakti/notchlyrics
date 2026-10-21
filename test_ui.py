@@ -551,17 +551,44 @@ app.viz_var.set(True)
 app.apply()
 root.update()
 
+# The active row is driven through app.state, not ov.texts: root.update() runs
+# the app's own tick loop, which would overwrite ov.texts mid-assert with
+# whatever the previous block left in state and make these checks pass by luck.
+def draw(lines, idx):
+    app.state["lines"], app.state["idx"] = lines, idx
+    app.tick_once()
+    root.update()
+    return {lbl.cget("text"): lbl for lbl in ov.lines if lbl.winfo_ismapped()}
+
+
+TEXT = ["a", "b", "c", "d", "e", "f"]
+
 # align=bottom puts the playhead on the last visible row
-app.preset(dict(nl.PRESET_CARD, lines=3))
-ov.texts = ["a", "b", "c", "d"]
-ov.idx = None
-ov.render(2.0)
-root.update()
-# playhead at the bottom means the active row is the last one drawn
-by_text = {lbl.cget("text"): lbl for lbl in ov.lines}
+app.preset(dict(nl.PRESET_CARD, lines=3, align="bottom"))
+by_text = draw(TEXT, 2)
 assert set(by_text) >= {"a", "b", "c"}, by_text.keys()
 assert by_text["c"].winfo_y() == 2 * ov.row_h(), by_text["c"].winfo_y()
 assert by_text["a"].winfo_y() == 0, by_text["a"].winfo_y()
+
+# align=top puts it on the first visible row: row 2 sits at y=0 and the
+# following lines fill downward from there. Six lines so the scroll clamp at
+# the end of the list does not mask the difference.
+app.preset(dict(nl.PRESET_CARD, lines=3, align="top"))
+by_text = draw(TEXT, 2)
+assert set(by_text) >= {"c", "d", "e"}, by_text.keys()
+assert by_text["c"].winfo_y() == 0, by_text["c"].winfo_y()
+assert by_text["d"].winfo_y() == ov.row_h(), by_text["d"].winfo_y()
+# and the playhead is the brightest row
+assert by_text["c"].cget("fg") == nl.PRESET_CARD["fg"], by_text["c"].cget("fg")
+
+# align=center keeps it in the middle row of three
+app.preset(dict(nl.PRESET_CARD, lines=3, align="center"))
+by_text = draw(TEXT, 2)
+assert by_text["c"].winfo_y() == ov.row_h(), by_text["c"].winfo_y()
+
+# the option the user asked for must survive sanitize and appear in the UI
+assert nl.sanitize({"align": "top"})["align"] == "top"
+assert "top" in app.align_box.cget("values"), app.align_box.cget("values")
 
 # --- position anchors ----------------------------------------------------------
 # Every anchor must place the window on the matching screen edge/corner, and

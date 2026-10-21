@@ -35,6 +35,7 @@ Everything is in the launcher window, and changes apply live:
 | **Preset: Spotify / Pill / Card** | one click sets every field below to that style |
 | Source | which player to follow. The list is built from the SMTC sessions Windows is publishing right now, so every open player appears (`Brave`, `Spotify`, `msedge`, …) and idle ones are listed too. A `tab: ` entry pins the overlay to one browser tab that is making sound, which is the only way to tell two tabs of the same browser apart (see below). `Auto` follows whichever session is actually playing. The field is editable, so a player that is not running yet can still be typed in |
 | Visible lines | 1 gives a single-line pill, 5 gives the Spotify panel |
+| Active line position | `top`, `center` or `bottom`: which of the visible rows carries the highlighted lyric. `bottom` means the playhead sits on the last row and the lyrics scroll up past it, `top` means it sits on the first row and they run down |
 | Row height | pitch between rows; total height is row height × visible lines. If it is shorter than the font's ink box it is raised automatically so descenders (`g y p j`) are never clipped |
 | Width (px) | width of the block |
 | Top offset | fine vertical nudge on top of **Position** |

@@ -602,7 +602,7 @@ def sanitize(raw):
     d["art"] = bool(d["art"])
     d["viz"] = bool(d["viz"])
     d["notch"] = bool(d["notch"])
-    d["align"] = d["align"] if d["align"] in ("center", "bottom") else DEFAULTS["align"]
+    d["align"] = d["align"] if d["align"] in ("top", "center", "bottom") else DEFAULTS["align"]
     d["anchor"] = (d["anchor"] if d["anchor"] in ANCHORS
                    else DEFAULTS["anchor"])
     num("radius", 0, 200)
@@ -975,11 +975,11 @@ class Overlay:
         vis = max(1, cfg["lines"])
         pos = max(0.0, min(float(self.pos), len(self.texts) - 1))
         self.pos = pos                     # keep it clamped for the next glide
-        # scroll so the playhead sits where the preset wants it, clamped at both ends
-        if cfg["align"] == "bottom":
-            top = max(0.0, min(pos - (vis - 1), max(0, len(self.texts) - vis)))
-        else:
-            top = max(0.0, min(pos - (vis - 1) / 2, max(0, len(self.texts) - vis)))
+        # scroll so the playhead sits where the preset wants it, clamped at both
+        # ends: top = first visible row, center = middle, bottom = last.
+        rows = max(0, len(self.texts) - vis)
+        off = {"top": 0.0, "center": 0.5, "bottom": 1.0}[cfg["align"]] * (vis - 1)
+        top = max(0.0, min(pos - off, rows))
         fg, dim = cfg["fg"], cfg["dim"]
         font = (cfg["font_family"], cfg["font_size"],
                 "bold" if cfg["bold"] else "normal")
@@ -1229,8 +1229,10 @@ class App:
 
         ttk.Label(f, text="Active line position").grid(row=r, column=0, sticky="w", pady=3)
         self.vars["align"] = tk.StringVar(value=c["align"])
-        ttk.Combobox(f, textvariable=self.vars["align"], values=("center", "bottom"),
-                     state="readonly", width=10).grid(row=r, column=1, sticky="w", padx=(10, 0))
+        al = ttk.Combobox(f, textvariable=self.vars["align"], values=("top", "center", "bottom"),
+                          state="readonly", width=10)
+        self.align_box = al
+        al.grid(row=r, column=1, sticky="w", padx=(10, 0))
         self.vars["align"].trace_add("write", lambda *_: self.apply())
         r += 1
 
