@@ -21,6 +21,7 @@ import time
 import tkinter as tk
 import urllib.parse
 import urllib.request
+import zlib
 from pathlib import Path
 from tkinter import colorchooser, font as tkfont, ttk
 
@@ -639,6 +640,28 @@ ANIM_FRAME_MS = 16     # ~60fps; coarse steps look like a jump, not a glide
 ENTER_MS = 240         # new-track entrance: slide up + fade in
 ENTER_SLIDE = 0.55     # how far the block travels, as a fraction of one row
 
+# One easing per track, chosen from the track's own text, so consecutive songs
+# do not all arrive with the identical motion. Deterministic: the same track
+# always gets the same curve, which matters because a re-fetch of the same song
+# must not change the feel mid-play.
+EASINGS = {
+    "out-cubic": lambda t: 1 - (1 - t) ** 3,
+    "out-quint": lambda t: 1 - (1 - t) ** 5,
+    "in-out-cubic": lambda t: 4 * t ** 3 if t < 0.5 else 1 - (-2 * t + 2) ** 3 / 2,
+    "out-back": lambda t: 1 + 2.70158 * (t - 1) ** 3 + 1.70158 * (t - 1) ** 2,
+}
+
+
+def ease_for(texts):
+    """Pick this track's easing curve from its lyrics, stably.
+
+    crc32 rather than hash(): CPython randomises string hashing per process, so
+    hash() would give the same song a different curve on every launch.
+    """
+    key = "\x00".join(texts or ()).encode("utf-8", "ignore")
+    names = sorted(EASINGS)
+    return EASINGS[names[zlib.crc32(key) % len(names)]]
+
 
 def lerp_color(c1, c2, t):
     """'#rrggbb' -> '#rrggbb' blended t of the way from c1 to c2."""
@@ -1102,11 +1125,12 @@ class Overlay:
                 pass
             self._enter_job = None
         self._enter = 0.0
+        self._enter_ease = ease_for(self.texts)
         t0 = time.monotonic()
 
         def step():
             t = min(1.0, (time.monotonic() - t0) * 1000 / ENTER_MS)
-            self._enter = 1 - (1 - t) ** 3            # ease-out
+            self._enter = min(1.0, max(0.0, self._enter_ease(t)))
             self.render()
             if t < 1:
                 self._enter_job = self.win.after(ANIM_FRAME_MS, step)

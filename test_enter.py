@@ -71,6 +71,24 @@ assert ov._enter == 1.0, ov._enter
 assert frame_state()[0][1] == 0, frame_state()
 print("enter_anim off -> snapped, no slide")
 
+# easing per track: deterministic for the same track, spread across tracks
+names = sorted(nl.EASINGS)
+seen = {nl.ease_for([f"track {i} line one", f"track {i} line two"]) for i in range(60)}
+assert len(seen) == len(names), ("not every curve is reachable", len(seen), names)
+# same track -> same curve, across separate calls (and across processes: crc32,
+# not hash(), which CPython salts per process)
+assert nl.ease_for(["a", "b"]) is nl.ease_for(["a", "b"])
+assert nl.ease_for([]) is nl.ease_for([])
+
+# every curve starts at 0 and lands exactly on 1, and none goes below 0.
+# out-back deliberately overshoots above 1 mid-flight (that is the "back" part);
+# render() clamps, so the overshoot cannot push a row past its slot.
+for name, fn in nl.EASINGS.items():
+    assert abs(fn(0.0)) < 1e-9, (name, fn(0.0))
+    assert abs(fn(1.0) - 1.0) < 1e-9, (name, fn(1.0))
+    vals = [fn(i / 40) for i in range(41)]
+    assert min(vals) >= -1e-9, (name, min(vals))
+
 # and the config round-trips
 assert nl.sanitize({"enter_anim": 0})["enter_anim"] is False
 assert nl.sanitize({})["enter_anim"] is True          # on by default
