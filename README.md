@@ -91,7 +91,7 @@ Verify the live SMTC session and real lyrics (a track must be playing):
 | `_probe()` | `sessions()` filtered by `is_song()` and handed to `pick_session()`; for a `tab: ` source it keeps the browser's session (position, length, cover) and uses the tab label to confirm the tab is still playing |
 | `fetch_lyrics()` | `lrclib.net/api/search` → `syncedLyrics` (free, no API key); picks the version whose duration matches the playing track |
 | `parse_lrc()` | `[mm:ss.xx]text` → `[(seconds, text)]` |
-| `poll()` | background thread: track + position → `state["lines"]` and `state["idx"]`. Re-reads the cover for a short window after a track change, because players publish the new title before the real artwork (Brave substitutes its own app icon first) |
+| `poll()` | background thread: track + position → `state["lines"]` and `state["idx"]`. Re-reads the cover for a short window after a track change, because players publish the new title before the real artwork (Brave substitutes its own app icon first) Holds the previous track's lyrics through the ~1 s SMTC gap of a track change (`GAP_S`), so the outgoing text is still on screen for the swap; a pause or stop still clears at once |
 | `screen_work()` | primary monitor's work area via `SystemParametersInfoW(SPI_GETWORKAREA)` — the screen minus the taskbar, on any side. Returns `None` if Windows reports nothing, and the caller falls back to the raw screen |
 | `anchor_xy()` | anchor + work area → top-left pixel. The single place that knows top edge is `work.top` and bottom edge is `work.bottom - h` |
 | `notch_corners()` | which corners stay rounded for a Position anchor: every corner not on a flush screen edge |
@@ -143,8 +143,9 @@ lacks `winsdk` (3.14, for instance): it relaunches itself with
   playing tab, ambiguous when two are.
 - A tab only appears in the Source list while it is making sound; Brave marks
   that with ` - Audio playing` in the tab's accessible name.
-- If the player drops the session entirely (Brave closed, playback stopped),
-  lyrics disappear until a new session appears.
+- If the player drops the session entirely (Brave closed, playback stopped) the
+  lyrics stay up for `GAP_S` (2 s) before disappearing, because a track change
+  tears the session down the same way. A pause or stop clears at once.
 - Tracks with no synced lyrics on lrclib fall back to `♪ title — artist`.
 - Multi-monitor: the overlay is always on the primary display.
 - Lyrics about 0.3 s ahead of the vocal? There is no offset control yet.

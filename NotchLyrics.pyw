@@ -30,6 +30,7 @@ MAGIC = "#010203"       # key colour Windows drops when -transparentcolor is on
 RETRY_S = 30            # re-ask lrclib after a failed fetch, don't cache the miss
 ART_RETRY_S = 1.0       # how often the cover stream is re-read after a track change
 ART_TRIES = 10          # ... up to this many reads, then keep whatever came
+GAP_S = 2.0             # a vanished SMTC session is a track change for this long
 TAB = "tab: "           # Source value prefix for a single browser tab
 _TABS = (0.0, [])       # (monotonic stamp, tab list) cache for browser_tabs()
 
@@ -383,6 +384,7 @@ def sessions():
                 "pos": max(pos, 0.0),
                 "len": tl.end_time.total_seconds() if tl.end_time else 0.0,
                 "playing": int(info.playback_status) == 4,
+                "status": int(info.playback_status),   # 0 closed, 2 changing, 5 paused
                 "thumb": p.thumbnail,          # stream ref, read lazily
             })
         return items
@@ -544,76 +546,91 @@ def poll(state, stop, cfg=None):
     fetched_at = 0.0
     fetched_key = ""         # which track's lyric fetch has come back
     art_key, art_tries, art_at = "", 0, 0.0
+    idle_at = None           # when the followed session stopped playing
     while not stop.is_set():
         try:
             np = _probe((cfg or {}).get("source", "Auto"))
         except Exception:
             np = None
-        if np:
-            key = np["title"] + "|" + np["artist"]
-            # A 503/timeout must not be cached as "this song has no lyrics" —
-            # retry every RETRY_S while we're still showing the title fallback.
-            stale = not lines and time.monotonic() - fetched_at > RETRY_S
-            # Do NOT clear `lines` on a track change. The previous fetch is what
-            # the overlay needs as its OUTGOING text: set_content() animates
-            # old -> new, and an emptied list in between made every live track
-            # change start from nothing, so only half the swap played (and, on a
-            # manual Next, none of it). The fetch below replaces it a moment
-            # later, which is itself the change the animation runs on.
-            if key != last_key or stale:
-                last_key = key
-                fetched_at = time.monotonic()
-                lines = fetch_lyrics(np["title"], np["artist"], np["len"])
-                fetched_key = key            # this track's fetch has returned
-            # A player publishes the new title before its real artwork. Brave
-            # puts its own 256x256 app icon in the thumbnail slot first (same
-            # bytes for every track), and the actual cover only turns up a few
-            # seconds later — measured at 0.3s for an icon, then 5-15s for a
-            # 150x150 cover on an automatic advance. A single read therefore
-            # latches the browser icon for the whole track, which is the
-            # "cover is missing, Brave icon instead" report. Pressing Next looks
-            # fine only because that path lands closer to when the real art is
-            # ready.
-            #
-            # So: drop the previous cover on a track change and keep re-reading
-            # for a short window, replacing what we have whenever the bytes
-            # change. Reading is cheap (a stream open per second, ten per track)
-            # and the last read wins, so no preference for "icon vs cover" has
-            # to be guessed.
-            if key != art_key:
-                art_key, art_tries, art_at = key, 0, 0.0
-                state["art"] = b""       # never keep the previous track's cover
-            if art_tries < ART_TRIES and time.monotonic() >= art_at:
-                art_tries += 1
-                art_at = time.monotonic() + ART_RETRY_S
-                png = art_png(np.get("thumb"))
-                if png and png != state["art"]:
-                    state["art"] = png
-            i = None
-            for idx, (t, _) in enumerate(lines):
-                if t <= np["pos"]:
-                    i = idx
-            if not np["playing"]:
-                state["lines"], state["idx"] = [], None
-            elif not lines and fetched_key != key:
-                # This track's fetch has not returned yet. Hold the previous
-                # lyrics on screen instead of flashing a one-line title: that
-                # intermediate state consumed the swap animation, so the real
-                # lyrics then appeared with no transition at all.
-                pass
-            elif not lines:
-                state["lines"] = [f"\u266a {np['title']} \u2014 {np['artist']}"]
-                state["idx"] = 0
-            else:
-                # Before the first timestamp there's no "current" line yet, but
-                # the lyrics ARE loaded — show them from the top instead of
-                # falling back to the title for the whole intro.
-                state["lines"], state["idx"] = [t for _, t in lines], i or 0
-        else:
+        if not (np and np["playing"]):
+            # A track change is not a stop. Measured on Brave: 15 ms after Next
+            # the old session reports CLOSED, 62 ms later there is no session at
+            # all for ~860 ms, and the new track arrives PLAYING at 922 ms.
+            # Clearing on that gap blanked the notch for the whole second and
+            # discarded the outgoing text set_content() animates from, so the
+            # new lyrics could only ever arrive. CLOSED/OPENED/CHANGING (or a
+            # briefly absent session) keeps the last state on screen; a pause,
+            # a stop, or a session that stays gone still clears.
+            if not np or np.get("status") in (0, 1, 2):
+                if idle_at is None:
+                    idle_at = time.monotonic()
+                if state["lines"] and time.monotonic() - idle_at < GAP_S:
+                    stop.wait(0.3)
+                    continue
             last_key, lines, art_key = "", [], ""
             fetched_key = ""
             state["lines"], state["idx"] = [], None
             state["art"] = b""
+            stop.wait(0.3)
+            continue
+        idle_at = None
+        key = np["title"] + "|" + np["artist"]
+        # A 503/timeout must not be cached as "this song has no lyrics" —
+        # retry every RETRY_S while we're still showing the title fallback.
+        stale = not lines and time.monotonic() - fetched_at > RETRY_S
+        # Do NOT clear `lines` on a track change. The previous fetch is what
+        # the overlay needs as its OUTGOING text: set_content() animates
+        # old -> new, and an emptied list in between made every live track
+        # change start from nothing, so only half the swap played (and, on a
+        # manual Next, none of it). The fetch below replaces it a moment
+        # later, which is itself the change the animation runs on.
+        if key != last_key or stale:
+            last_key = key
+            fetched_at = time.monotonic()
+            lines = fetch_lyrics(np["title"], np["artist"], np["len"])
+            fetched_key = key            # this track's fetch has returned
+        # A player publishes the new title before its real artwork. Brave
+        # puts its own 256x256 app icon in the thumbnail slot first (same
+        # bytes for every track), and the actual cover only turns up a few
+        # seconds later — measured at 0.3s for an icon, then 5-15s for a
+        # 150x150 cover on an automatic advance. A single read therefore
+        # latches the browser icon for the whole track, which is the
+        # "cover is missing, Brave icon instead" report. Pressing Next looks
+        # fine only because that path lands closer to when the real art is
+        # ready.
+        #
+        # So: drop the previous cover on a track change and keep re-reading
+        # for a short window, replacing what we have whenever the bytes
+        # change. Reading is cheap (a stream open per second, ten per track)
+        # and the last read wins, so no preference for "icon vs cover" has
+        # to be guessed.
+        if key != art_key:
+            art_key, art_tries, art_at = key, 0, 0.0
+            state["art"] = b""       # never keep the previous track's cover
+        if art_tries < ART_TRIES and time.monotonic() >= art_at:
+            art_tries += 1
+            art_at = time.monotonic() + ART_RETRY_S
+            png = art_png(np.get("thumb"))
+            if png and png != state["art"]:
+                state["art"] = png
+        i = None
+        for idx, (t, _) in enumerate(lines):
+            if t <= np["pos"]:
+                i = idx
+        if not lines and fetched_key != key:
+            # This track's fetch has not returned yet. Hold the previous
+            # lyrics on screen instead of flashing a one-line title: that
+            # intermediate state consumed the swap animation, so the real
+            # lyrics then appeared with no transition at all.
+            pass
+        elif not lines:
+            state["lines"] = [f"\u266a {np['title']} \u2014 {np['artist']}"]
+            state["idx"] = 0
+        else:
+            # Before the first timestamp there's no "current" line yet, but
+            # the lyrics ARE loaded — show them from the top instead of
+            # falling back to the title for the whole intro.
+            state["lines"], state["idx"] = [t for _, t in lines], i or 0
         stop.wait(0.3)
 
 

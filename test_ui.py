@@ -45,11 +45,17 @@ ov = app.overlay
 
 
 def settle(limit=2.0):
-    """Pump the event loop until the transition animation finishes."""
+    """Pump the event loop until the transition animation finishes.
+
+    Both animations count: _anim_job is the per-line glide, _enter_job is the
+    track swap. Waiting on the glide alone returned instantly during a swap,
+    so every assertion below read the labels at the midpoint of the fade --
+    where the text colour is the card colour, i.e. #000000 for all of them.
+    """
     end = time.monotonic() + limit
     while time.monotonic() < end:
         root.update()
-        if ov._anim_job is None:
+        if ov._anim_job is None and getattr(ov, "_enter_job", None) is None:
             return
         time.sleep(0.01)
     raise AssertionError("animation never finished")
@@ -362,6 +368,59 @@ stop2.set()
 th2.join(timeout=2)
 nl._probe, nl.fetch_lyrics = real_probe, real_fetch
 print("song change: ok")
+
+# --- manual Next: the session vanishes for ~1s; the notch must not blank ----
+# Measured on Brave: 15 ms after Next the old session is CLOSED, at 62 ms
+# get_current_session() returns None for ~860 ms, and at 922 ms the next track
+# arrives PLAYING. poll() used to clear the lyrics on that gap, which blanked
+# the overlay for the whole second and discarded the outgoing text the swap
+# animates from, so the new lyrics could only arrive.
+gap = {"t0": None, "paused": False}
+
+def probe_gap(source="Auto"):
+    if gap["paused"]:
+        return {"title": "B", "artist": "y", "pos": 5.0, "len": 180.0,
+                "playing": False, "status": 5}       # PAUSED
+    if gap["t0"] is None:
+        return {"title": "A", "artist": "x", "pos": 150.0, "len": 200.0,
+                "playing": True, "status": 4}
+    dt = time.monotonic() - gap["t0"]
+    if dt < 0.015:
+        return {"title": "A", "artist": "x", "pos": 150.0, "len": 200.0,
+                "playing": False, "status": 0}       # CLOSED
+    if dt < 0.922:
+        return None                                  # no session at all
+    return {"title": "B", "artist": "y", "pos": 5.0, "len": 180.0,
+            "playing": True, "status": 4}
+
+nl._probe, nl.fetch_lyrics = probe_gap, fetch_switch
+st4 = {"lines": [], "idx": None, "art": b""}
+stop4 = threading.Event()
+th4 = threading.Thread(target=real_poll, args=(st4, stop4), daemon=True)
+th4.start()
+
+time.sleep(0.7)
+assert st4["lines"] and st4["lines"][0].startswith("a"), st4
+gap["t0"] = time.monotonic()
+blank = []
+end = gap["t0"] + 1.6
+while time.monotonic() < end:
+    if not st4["lines"]:
+        blank.append(time.monotonic() - gap["t0"])
+    time.sleep(0.01)
+assert not blank, f"notch blank for {blank[-1] - blank[0]:.2f}s during a track change"
+# old -> new in one step: that step is what the left-right swap animates
+assert st4["lines"] == ["b first", "b second"], st4["lines"]
+
+# a pause is not a track change: it still clears at once
+gap["paused"] = True
+time.sleep(0.5)
+assert st4["lines"] == [], st4
+
+stop4.set()
+th4.join(timeout=2)
+nl._probe, nl.fetch_lyrics = real_probe, real_fetch
+print("track change: no blank gap; pause still clears")
 
 # --- the player's placeholder art is replaced when the real cover arrives ----
 # Brave flips the session to the next song and puts its own 256x256 app icon in
